@@ -31,7 +31,7 @@ const CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
 const BOT_TYPE = "3";
 const CREDENTIALS_FILE = process.env.WECHAT_CREDENTIALS_FILE
   ? path.resolve(process.env.WECHAT_CREDENTIALS_FILE)
-  : path.join(process.env.HOME || "~", ".claude", "channels", "wechat", "account.json");
+  : path.join(os.homedir(), ".claude", "channels", "wechat", "account.json");
 const CREDENTIALS_DIR = path.dirname(CREDENTIALS_FILE);
 const MEDIA_DIR = path.join(CREDENTIALS_DIR, "media");
 
@@ -307,8 +307,9 @@ async function sendMediaMessage(baseUrl: string, token: string, to: string, text
   const uploaded = await uploadMediaFile(filePath, to, baseUrl, token, mediaType);
   log(`上传成功: filekey=${uploaded.filekey} size=${uploaded.fileSize}`);
 
-  // aeskey is a 32-char hex string; base64-encode the hex string directly (matches official SDK)
-  const aesKeyBase64 = Buffer.from(uploaded.aeskey).toString("base64");
+  // aeskey is a 32-char hex string; convert to raw 16 bytes then base64-encode
+  // This matches cc-connect's encoding: base64(raw_16_bytes) → 24-char string
+  const aesKeyBase64 = Buffer.from(uploaded.aeskey, "hex").toString("base64");
   const mediaRef = { encrypt_query_param: uploaded.downloadEncryptedQueryParam, aes_key: aesKeyBase64, encrypt_type: 1 };
 
   let mediaItem: any;
@@ -663,11 +664,10 @@ const mcp = new Server(
       "Keep replies concise. Strip markdown formatting (WeChat doesn't render it).",
       "",
       "INTERACTION PATTERN for complex requests:",
-      "1. When a request requires tool calls, FIRST call wechat_thinking with a short status (e.g. '正在阅读文件...'). This shows a temporary bubble that will be REPLACED by your final answer.",
+      "1. When a request requires tool calls, FIRST call wechat_thinking with a short status (e.g. '正在阅读文件...'). This shows a status message and starts a typing indicator.",
       "2. Perform the tool calls.",
-      "3. Call wechat_reply with the reply_id returned by wechat_thinking. This REPLACES the thinking bubble with your final answer, keeping the chat clean.",
-      "4. If the task has multiple stages, you can call wechat_thinking again (with the same reply_id) to update the status text before the final reply.",
-      "IMPORTANT: Always pass reply_id from wechat_thinking to wechat_reply so the temporary message gets replaced, not left behind.",
+      "3. Call wechat_reply to send the final answer. The thinking message stays as a separate status record.",
+      "NOTE: The WeChat ilink bot API does not support in-place message updates. Thinking and reply are separate messages.",
     ].join("\n"),
   },
 );
@@ -679,26 +679,24 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "wechat_thinking",
-      description: "Send a temporary 'thinking/processing' status message. This bubble will be REPLACED when you later call wechat_reply with the returned reply_id. Use this before doing tool calls so the user sees progress.",
+      description: "Send a 'thinking/processing' status message and start a typing indicator. Use before tool calls so the user sees progress.",
       inputSchema: {
         type: "object" as const,
         properties: {
           sender_id: { type: "string", description: "The sender_id (xxx@im.wechat)" },
           text: { type: "string", description: "Short status text, e.g. '正在阅读文件...' or '正在检索文献...'" },
-          reply_id: { type: "string", description: "If updating a previous thinking message, pass its reply_id to overwrite it" },
         },
         required: ["sender_id", "text"],
       },
     },
     {
       name: "wechat_reply",
-      description: "Send the final text reply. If reply_id is provided (from wechat_thinking), it REPLACES the thinking bubble. Otherwise sends a new message.",
+      description: "Send the final text reply. Long messages are automatically split into multiple parts.",
       inputSchema: {
         type: "object" as const,
         properties: {
           sender_id: { type: "string", description: "The sender_id from the inbound <channel> tag (xxx@im.wechat)" },
           text: { type: "string", description: "Plain-text message to send (no markdown)" },
-          reply_id: { type: "string", description: "The reply_id from wechat_thinking — pass this to replace the thinking bubble with the final answer" },
         },
         required: ["sender_id", "text"],
       },
@@ -725,7 +723,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 
   if (req.params.name === "wechat_thinking") {
-    const { sender_id, text } = req.params.arguments as { sender_id: string; text: string; reply_id?: string };
+    const { sender_id, text } = req.params.arguments as { sender_id: string; text: string };
     const contextToken = getCachedContextToken(sender_id);
     if (!contextToken) return { content: [{ type: "text" as const, text: `error: no context_token for ${sender_id}` }] };
     try {
@@ -740,7 +738,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 
   if (req.params.name === "wechat_reply") {
-    const { sender_id, text } = req.params.arguments as { sender_id: string; text: string; reply_id?: string };
+    const { sender_id, text } = req.params.arguments as { sender_id: string; text: string };
     const contextToken = getCachedContextToken(sender_id);
     if (!contextToken) return { content: [{ type: "text" as const, text: `error: no context_token for ${sender_id}` }] };
     try {

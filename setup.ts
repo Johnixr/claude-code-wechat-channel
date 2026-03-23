@@ -11,13 +11,14 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 const BOT_TYPE = "3";
 const CREDENTIALS_FILE = process.env.WECHAT_CREDENTIALS_FILE
   ? path.resolve(process.env.WECHAT_CREDENTIALS_FILE)
-  : path.join(process.env.HOME || "~", ".claude", "channels", "wechat", "account.json");
+  : path.join(os.homedir(), ".claude", "channels", "wechat", "account.json");
 const CREDENTIALS_DIR = path.dirname(CREDENTIALS_FILE);
 
 interface QRCodeResponse {
