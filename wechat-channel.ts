@@ -307,9 +307,8 @@ async function sendMediaMessage(baseUrl: string, token: string, to: string, text
   const uploaded = await uploadMediaFile(filePath, to, baseUrl, token, mediaType);
   log(`上传成功: filekey=${uploaded.filekey} size=${uploaded.fileSize}`);
 
-  // aeskey is a 32-char hex string; convert to raw 16 bytes then base64-encode
-  // This matches cc-connect's encoding: base64(raw_16_bytes) → 24-char string
-  const aesKeyBase64 = Buffer.from(uploaded.aeskey, "hex").toString("base64");
+  // aeskey is a 32-char hex string; base64-encode the hex string directly (matches official SDK)
+  const aesKeyBase64 = Buffer.from(uploaded.aeskey).toString("base64");
   const mediaRef = { encrypt_query_param: uploaded.downloadEncryptedQueryParam, aes_key: aesKeyBase64, encrypt_type: 1 };
 
   let mediaItem: any;
