@@ -1,5 +1,4 @@
 #!/usr/bin/env bun
-// @bun
 import { createRequire } from "node:module";
 var __create = Object.create;
 var __getProtoOf = Object.getPrototypeOf;

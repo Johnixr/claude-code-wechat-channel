@@ -13,7 +13,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "bun build wechat-channel.ts --target node --outfile dist/wechat-channel.js && bun build setup.ts --target node --outfile dist/setup.js",
+    "build": "bun build wechat-channel.ts --target node --outfile dist/wechat-channel.js && bun build setup.ts --target node --outfile dist/setup.js && npm run strip-bun-marker",
+    "strip-bun-marker": "node -e \"const fs=require('fs');['dist/setup.js','dist/wechat-channel.js'].forEach(f=>{fs.writeFileSync(f,fs.readFileSync(f,'utf8').replace(/\\/\\/ @bun\\n/,''))})\"",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
