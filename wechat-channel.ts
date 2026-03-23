@@ -559,13 +559,33 @@ function extractContent(msg: WeixinMessage): ExtractedContent | null {
   return null;
 }
 
-// ── Context token cache ───────────────────────────────────────────────────────
+// ── Context token cache (persisted to disk across session restarts) ───────────
 // Key: senderId (DM) or groupId (group chat)
 
-const contextTokenCache = new Map<string, string>();
+const CONTEXT_TOKEN_FILE = path.join(CREDENTIALS_DIR, "context_tokens.json");
+
+const contextTokenCache = new Map<string, string>(
+  (() => {
+    try {
+      const raw = fs.readFileSync(CONTEXT_TOKEN_FILE, "utf-8");
+      return Object.entries(JSON.parse(raw)) as [string, string][];
+    } catch {
+      return [];
+    }
+  })(),
+);
 
 function cacheContextToken(key: string, token: string): void {
   contextTokenCache.set(key, token);
+  // Persist to disk so the token survives Claude Code session restarts
+  try {
+    fs.mkdirSync(CREDENTIALS_DIR, { recursive: true });
+    fs.writeFileSync(
+      CONTEXT_TOKEN_FILE,
+      JSON.stringify(Object.fromEntries(contextTokenCache), null, 2),
+      "utf-8",
+    );
+  } catch { /* best-effort */ }
 }
 
 function getCachedContextToken(key: string): string | undefined {
@@ -696,6 +716,7 @@ const mcp = new Server(
       "  sender       — display name (xxx part of xxx@im.wechat)",
       "  sender_id    — full user ID (xxx@im.wechat) — REQUIRED for all reply tools",
       "  msg_type     — text | voice | image | file | video | unknown",
+      "  can_reply    — 'true': reply normally; 'false': no session token, tell the user to send another message",
       "  is_group     — 'true' if from a group chat",
       "  group_id     — group ID when is_group=true (use this as the reply target in groups)",
       "",
@@ -704,7 +725,8 @@ const mcp = new Server(
       "  wechat_send_image   — send an image file from local disk (provide absolute path)",
       "",
       "Rules:",
-      "  - Always use wechat_reply or wechat_send_image — never leave a message unanswered.",
+      "  - If can_reply=false, do NOT call wechat_reply. Instead output: 'NOTICE: cannot reply, session token missing. User must send one more message.'",
+      "  - Otherwise always use wechat_reply or wechat_send_image — never leave a message unanswered.",
       "  - In group chats (is_group=true), pass the group_id as sender_id to reply to the group.",
       "  - Strip all markdown — WeChat renders plain text only.",
       "  - Keep replies concise. WeChat is a chat app.",
@@ -878,13 +900,18 @@ async function startPolling(account: AccountData): Promise<never> {
           cacheContextToken(contextKey, msg.context_token);
           // In group chats also cache by sender_id so Claude can refer back
           if (isGroup) cacheContextToken(senderId, msg.context_token);
+        } else {
+          logError(`消息缺少 context_token: from=${senderId} — 无法回复，等待下一条消息`);
         }
 
-        const senderShort = senderId.split("@")[0] || senderId;
-        log(`收到${isGroup ? "群" : "私"}消息 [${extracted.msgType}]: from=${senderShort}${isGroup ? ` group=${groupId}` : ""} "${extracted.text.slice(0, 60)}"`);
+        // Determine whether we can reply (need a context_token, either fresh or cached)
+        const canReply = Boolean(getCachedContextToken(contextKey));
 
-        // Show typing indicator (fire-and-forget)
-        if (msg.context_token) {
+        const senderShort = senderId.split("@")[0] || senderId;
+        log(`收到${isGroup ? "群" : "私"}消息 [${extracted.msgType}]: from=${senderShort}${isGroup ? ` group=${groupId}` : ""} can_reply=${canReply} "${extracted.text.slice(0, 60)}"`);
+
+        // Show typing indicator only when we can actually reply
+        if (canReply && msg.context_token) {
           showTypingIndicator(baseUrl, token, senderId, msg.context_token).catch(() => {});
         }
 
@@ -893,6 +920,7 @@ async function startPolling(account: AccountData): Promise<never> {
           sender: senderShort,
           sender_id: isGroup ? (groupId as string) : senderId,
           msg_type: extracted.msgType,
+          can_reply: String(canReply),
         };
         if (isGroup) {
           meta.is_group = "true";
