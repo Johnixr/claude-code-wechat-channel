@@ -15,13 +15,10 @@ import path from "node:path";
 
 const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 const BOT_TYPE = "3";
-const CREDENTIALS_DIR = path.join(
-  process.env.HOME || "~",
-  ".claude",
-  "channels",
-  "wechat",
-);
-const CREDENTIALS_FILE = path.join(CREDENTIALS_DIR, "account.json");
+const CREDENTIALS_FILE = process.env.WECHAT_CREDENTIALS_FILE
+  ? path.resolve(process.env.WECHAT_CREDENTIALS_FILE)
+  : path.join(process.env.HOME || "~", ".claude", "channels", "wechat", "account.json");
+const CREDENTIALS_DIR = path.dirname(CREDENTIALS_FILE);
 
 interface QRCodeResponse {
   qrcode: string;
@@ -71,7 +68,8 @@ async function pollQRStatus(
 
 async function main() {
   // Check existing credentials
-  if (fs.existsSync(CREDENTIALS_FILE)) {
+  const forceRelogin = process.argv.includes("--force") || process.argv.includes("-f");
+  if (fs.existsSync(CREDENTIALS_FILE) && !forceRelogin) {
     try {
       const existing = JSON.parse(fs.readFileSync(CREDENTIALS_FILE, "utf-8"));
       console.log(`已有保存的账号: ${existing.accountId}`);
