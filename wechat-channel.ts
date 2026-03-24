@@ -13,6 +13,7 @@
  */
 
 import crypto from "node:crypto";
+import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -597,6 +598,73 @@ function aesEncrypt(data: Buffer, key: Buffer): Buffer {
   return Buffer.concat([cipher.update(data), cipher.final()]);
 }
 
+interface CdnUploadResult {
+  downloadEqp: string;
+  aesKeyHex: string;
+  aesKeyBase64: string;
+}
+
+async function uploadToCdn(
+  baseUrl: string,
+  token: string,
+  to: string,
+  rawData: Buffer,
+  mediaTypeNum: number,
+): Promise<CdnUploadResult> {
+  const rawMd5 = md5Hash(rawData);
+  const aesKeyBytes = crypto.randomBytes(16);
+  const aesKeyHex = aesKeyBytes.toString("hex");
+  const filekey = crypto.randomBytes(16).toString("hex");
+  const encrypted = aesEncrypt(rawData, aesKeyBytes);
+
+  const uploadEqp = await getUploadUrl(baseUrl, token, {
+    filekey,
+    media_type: mediaTypeNum,
+    to_user_id: to,
+    rawsize: rawData.length,
+    rawfilemd5: rawMd5,
+    filesize: encrypted.length,
+    aeskey: aesKeyHex,
+  });
+
+  const uploadUrl = `${CDN_UPLOAD_URL}?encrypted_query_param=${encodeURIComponent(uploadEqp)}&filekey=${encodeURIComponent(filekey)}`;
+  const uploadRes = await fetch(uploadUrl, {
+    method: "POST",
+    body: encrypted,
+    headers: { "Content-Type": "application/octet-stream" },
+  });
+  if (!uploadRes.ok) {
+    throw new Error(`CDN upload failed: HTTP ${uploadRes.status}`);
+  }
+
+  const downloadEqp = uploadRes.headers.get("x-encrypted-query-param");
+  if (!downloadEqp) {
+    throw new Error("CDN upload did not return x-encrypted-query-param header");
+  }
+
+  return {
+    downloadEqp,
+    aesKeyHex,
+    aesKeyBase64: Buffer.from(aesKeyHex, "utf-8").toString("base64"),
+  };
+}
+
+function generateVideoThumbnail(videoPath: string): Buffer | null {
+  const thumbPath = path.join(MEDIA_DIR, `thumb-${Date.now()}.jpg`);
+  try {
+    fs.mkdirSync(MEDIA_DIR, { recursive: true });
+    execSync(
+      `ffmpeg -y -i "${videoPath}" -vframes 1 -vf "scale=224:-1" "${thumbPath}"`,
+      { stdio: "pipe", timeout: 10_000 },
+    );
+    const data = fs.readFileSync(thumbPath);
+    fs.unlinkSync(thumbPath);
+    return data;
+  } catch {
+    return null;
+  }
+}
+
 async function uploadAndSendMedia(
   baseUrl: string,
   token: string,
@@ -608,51 +676,16 @@ async function uploadAndSendMedia(
   const rawData = fs.readFileSync(filePath);
   const rawMd5 = md5Hash(rawData);
 
-  // Generate AES key and filekey
-  const aesKeyBytes = crypto.randomBytes(16);
-  const aesKeyHex = aesKeyBytes.toString("hex");
-  const filekey = crypto.randomBytes(16).toString("hex");
-
-  // Encrypt file
-  const encrypted = aesEncrypt(rawData, aesKeyBytes);
-
   // Map media type to API constant
   const mediaTypeMap = { image: 1, video: 2, file: 3 } as const;
   const apiMediaType = mediaTypeMap[mediaType];
 
-  // Get upload URL
-  const uploadEqp = await getUploadUrl(baseUrl, token, {
-    filekey,
-    media_type: apiMediaType,
-    to_user_id: to,
-    rawsize: rawData.length,
-    rawfilemd5: rawMd5,
-    filesize: encrypted.length,
-    aeskey: aesKeyHex,
-  });
+  // Upload main file to CDN
+  const main = await uploadToCdn(baseUrl, token, to, rawData, apiMediaType);
 
-  // Upload encrypted file to CDN
-  const uploadUrl = `${CDN_UPLOAD_URL}?encrypted_query_param=${encodeURIComponent(uploadEqp)}&filekey=${encodeURIComponent(filekey)}`;
-  const uploadRes = await fetch(uploadUrl, {
-    method: "POST",
-    body: encrypted,
-    headers: { "Content-Type": "application/octet-stream" },
-  });
-  if (!uploadRes.ok) {
-    throw new Error(`CDN upload failed: HTTP ${uploadRes.status}`);
-  }
-
-  // Get download param from response header
-  const downloadEqp = uploadRes.headers.get("x-encrypted-query-param");
-  if (!downloadEqp) {
-    throw new Error("CDN upload did not return x-encrypted-query-param header");
-  }
-
-  // Build media item
-  const aesKeyBase64 = Buffer.from(aesKeyHex, "utf-8").toString("base64");
-  const mediaField = {
-    encrypt_query_param: downloadEqp,
-    aes_key: aesKeyBase64,
+  const mainMediaField = {
+    encrypt_query_param: main.downloadEqp,
+    aes_key: main.aesKeyBase64,
     encrypt_type: 0,
   };
 
@@ -663,26 +696,63 @@ async function uploadAndSendMedia(
     itemType = MSG_ITEM_IMAGE;
     itemPayload = {
       image_item: {
-        media: mediaField,
-        aeskey: aesKeyHex,
+        media: mainMediaField,
+        aeskey: main.aesKeyHex,
         mid_size: rawData.length,
         hd_size: rawData.length,
       },
     };
   } else if (mediaType === "video") {
     itemType = MSG_ITEM_VIDEO;
+
+    // Generate and upload thumbnail
+    const thumbData = generateVideoThumbnail(filePath);
+    let thumbPayload: Record<string, unknown> = {};
+
+    if (thumbData) {
+      try {
+        const thumb = await uploadToCdn(baseUrl, token, to, thumbData, 1); // upload as image
+        thumbPayload = {
+          thumb_media: {
+            encrypt_query_param: thumb.downloadEqp,
+            aes_key: thumb.aesKeyBase64,
+            encrypt_type: 0,
+          },
+          thumb_size: thumbData.length,
+          thumb_width: 224,
+          thumb_height: 398,
+        };
+      } catch (err) {
+        logError(`缩略图上传失败: ${String(err)}`);
+      }
+    }
+
+    // Get video duration with ffprobe
+    let playLength = 0;
+    try {
+      const durationStr = execSync(
+        `ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${filePath}"`,
+        { stdio: "pipe", timeout: 10_000 },
+      ).toString().trim();
+      playLength = Math.round(parseFloat(durationStr));
+    } catch {
+      // ignore
+    }
+
     itemPayload = {
       video_item: {
-        media: mediaField,
+        media: mainMediaField,
         video_size: rawData.length,
+        play_length: playLength,
         video_md5: rawMd5,
+        ...thumbPayload,
       },
     };
   } else {
     itemType = MSG_ITEM_FILE;
     itemPayload = {
       file_item: {
-        media: mediaField,
+        media: mainMediaField,
         file_name: path.basename(filePath),
         md5: rawMd5,
         len: String(rawData.length),
@@ -691,21 +761,22 @@ async function uploadAndSendMedia(
   }
 
   const clientId = generateClientId();
+  const sendBody = {
+    msg: {
+      from_user_id: "",
+      to_user_id: to,
+      client_id: clientId,
+      message_type: MSG_TYPE_BOT,
+      message_state: MSG_STATE_FINISH,
+      item_list: [{ type: itemType, ...itemPayload }],
+      context_token: contextToken,
+    },
+    base_info: { channel_version: CHANNEL_VERSION },
+  };
   await apiFetch({
     baseUrl,
     endpoint: "ilink/bot/sendmessage",
-    body: JSON.stringify({
-      msg: {
-        from_user_id: "",
-        to_user_id: to,
-        client_id: clientId,
-        message_type: MSG_TYPE_BOT,
-        message_state: MSG_STATE_FINISH,
-        item_list: [{ type: itemType, ...itemPayload }],
-        context_token: contextToken,
-      },
-      base_info: { channel_version: CHANNEL_VERSION },
-    }),
+    body: JSON.stringify(sendBody),
     token,
     timeoutMs: 30_000,
   });

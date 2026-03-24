@@ -7536,6 +7536,7 @@ var require_main = __commonJS((exports, module) => {
 
 // wechat-channel.ts
 import crypto from "crypto";
+import { execSync } from "child_process";
 import fs from "fs";
 import path from "path";
 
@@ -15830,18 +15831,15 @@ function aesEncrypt(data, key) {
   const cipher = crypto.createCipheriv("aes-128-ecb", key, null);
   return Buffer.concat([cipher.update(data), cipher.final()]);
 }
-async function uploadAndSendMedia(baseUrl, token, to, contextToken, filePath, mediaType) {
-  const rawData = fs.readFileSync(filePath);
+async function uploadToCdn(baseUrl, token, to, rawData, mediaTypeNum) {
   const rawMd5 = md5Hash(rawData);
   const aesKeyBytes = crypto.randomBytes(16);
   const aesKeyHex = aesKeyBytes.toString("hex");
   const filekey = crypto.randomBytes(16).toString("hex");
   const encrypted = aesEncrypt(rawData, aesKeyBytes);
-  const mediaTypeMap = { image: 1, video: 2, file: 3 };
-  const apiMediaType = mediaTypeMap[mediaType];
   const uploadEqp = await getUploadUrl(baseUrl, token, {
     filekey,
-    media_type: apiMediaType,
+    media_type: mediaTypeNum,
     to_user_id: to,
     rawsize: rawData.length,
     rawfilemd5: rawMd5,
@@ -15861,10 +15859,33 @@ async function uploadAndSendMedia(baseUrl, token, to, contextToken, filePath, me
   if (!downloadEqp) {
     throw new Error("CDN upload did not return x-encrypted-query-param header");
   }
-  const aesKeyBase64 = Buffer.from(aesKeyHex, "utf-8").toString("base64");
-  const mediaField = {
-    encrypt_query_param: downloadEqp,
-    aes_key: aesKeyBase64,
+  return {
+    downloadEqp,
+    aesKeyHex,
+    aesKeyBase64: Buffer.from(aesKeyHex, "utf-8").toString("base64")
+  };
+}
+function generateVideoThumbnail(videoPath) {
+  const thumbPath = path.join(MEDIA_DIR, `thumb-${Date.now()}.jpg`);
+  try {
+    fs.mkdirSync(MEDIA_DIR, { recursive: true });
+    execSync(`ffmpeg -y -i "${videoPath}" -vframes 1 -vf "scale=224:-1" "${thumbPath}"`, { stdio: "pipe", timeout: 1e4 });
+    const data = fs.readFileSync(thumbPath);
+    fs.unlinkSync(thumbPath);
+    return data;
+  } catch {
+    return null;
+  }
+}
+async function uploadAndSendMedia(baseUrl, token, to, contextToken, filePath, mediaType) {
+  const rawData = fs.readFileSync(filePath);
+  const rawMd5 = md5Hash(rawData);
+  const mediaTypeMap = { image: 1, video: 2, file: 3 };
+  const apiMediaType = mediaTypeMap[mediaType];
+  const main = await uploadToCdn(baseUrl, token, to, rawData, apiMediaType);
+  const mainMediaField = {
+    encrypt_query_param: main.downloadEqp,
+    aes_key: main.aesKeyBase64,
     encrypt_type: 0
   };
   let itemType;
@@ -15873,26 +15894,52 @@ async function uploadAndSendMedia(baseUrl, token, to, contextToken, filePath, me
     itemType = MSG_ITEM_IMAGE;
     itemPayload = {
       image_item: {
-        media: mediaField,
-        aeskey: aesKeyHex,
+        media: mainMediaField,
+        aeskey: main.aesKeyHex,
         mid_size: rawData.length,
         hd_size: rawData.length
       }
     };
   } else if (mediaType === "video") {
     itemType = MSG_ITEM_VIDEO;
+    const thumbData = generateVideoThumbnail(filePath);
+    let thumbPayload = {};
+    if (thumbData) {
+      try {
+        const thumb = await uploadToCdn(baseUrl, token, to, thumbData, 1);
+        thumbPayload = {
+          thumb_media: {
+            encrypt_query_param: thumb.downloadEqp,
+            aes_key: thumb.aesKeyBase64,
+            encrypt_type: 0
+          },
+          thumb_size: thumbData.length,
+          thumb_width: 224,
+          thumb_height: 398
+        };
+      } catch (err) {
+        logError(`\u7F29\u7565\u56FE\u4E0A\u4F20\u5931\u8D25: ${String(err)}`);
+      }
+    }
+    let playLength = 0;
+    try {
+      const durationStr = execSync(`ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${filePath}"`, { stdio: "pipe", timeout: 1e4 }).toString().trim();
+      playLength = Math.round(parseFloat(durationStr));
+    } catch {}
     itemPayload = {
       video_item: {
-        media: mediaField,
+        media: mainMediaField,
         video_size: rawData.length,
-        video_md5: rawMd5
+        play_length: playLength,
+        video_md5: rawMd5,
+        ...thumbPayload
       }
     };
   } else {
     itemType = MSG_ITEM_FILE;
     itemPayload = {
       file_item: {
-        media: mediaField,
+        media: mainMediaField,
         file_name: path.basename(filePath),
         md5: rawMd5,
         len: String(rawData.length)
@@ -15900,21 +15947,22 @@ async function uploadAndSendMedia(baseUrl, token, to, contextToken, filePath, me
     };
   }
   const clientId = generateClientId();
+  const sendBody = {
+    msg: {
+      from_user_id: "",
+      to_user_id: to,
+      client_id: clientId,
+      message_type: MSG_TYPE_BOT,
+      message_state: MSG_STATE_FINISH,
+      item_list: [{ type: itemType, ...itemPayload }],
+      context_token: contextToken
+    },
+    base_info: { channel_version: CHANNEL_VERSION }
+  };
   await apiFetch({
     baseUrl,
     endpoint: "ilink/bot/sendmessage",
-    body: JSON.stringify({
-      msg: {
-        from_user_id: "",
-        to_user_id: to,
-        client_id: clientId,
-        message_type: MSG_TYPE_BOT,
-        message_state: MSG_STATE_FINISH,
-        item_list: [{ type: itemType, ...itemPayload }],
-        context_token: contextToken
-      },
-      base_info: { channel_version: CHANNEL_VERSION }
-    }),
+    body: JSON.stringify(sendBody),
     token,
     timeoutMs: 30000
   });
