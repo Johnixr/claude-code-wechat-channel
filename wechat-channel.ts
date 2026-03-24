@@ -543,6 +543,168 @@ async function sendTextMessage(
   return clientId;
 }
 
+// ── Media Upload & Send ──────────────────────────────────────────────────────
+
+const CDN_UPLOAD_URL = "https://novac2c.cdn.weixin.qq.com/c2c/upload";
+
+interface UploadUrlResponse {
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
+  encrypted_query_param?: string;
+}
+
+async function getUploadUrl(
+  baseUrl: string,
+  token: string,
+  params: {
+    filekey: string;
+    media_type: number; // 1=image, 2=video, 3=file, 4=voice
+    to_user_id: string;
+    rawsize: number;
+    rawfilemd5: string;
+    filesize: number;
+    aeskey: string;
+    no_need_thumb?: boolean;
+  },
+): Promise<string> {
+  const raw = await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/getuploadurl",
+    body: JSON.stringify({
+      ...params,
+      no_need_thumb: params.no_need_thumb ?? true,
+      base_info: { channel_version: CHANNEL_VERSION },
+    }),
+    token,
+    timeoutMs: 15_000,
+  });
+  const resp = JSON.parse(raw) as UploadUrlResponse;
+  if (!resp.encrypted_query_param) {
+    throw new Error(`getuploadurl failed: ${raw}`);
+  }
+  return resp.encrypted_query_param;
+}
+
+function md5Hash(data: Buffer): string {
+  return crypto.createHash("md5").update(data).digest("hex");
+}
+
+function aesEncrypt(data: Buffer, key: Buffer): Buffer {
+  const cipher = crypto.createCipheriv("aes-128-ecb", key, null);
+  return Buffer.concat([cipher.update(data), cipher.final()]);
+}
+
+async function uploadAndSendMedia(
+  baseUrl: string,
+  token: string,
+  to: string,
+  contextToken: string,
+  filePath: string,
+  mediaType: "image" | "video" | "file",
+): Promise<string> {
+  const rawData = fs.readFileSync(filePath);
+  const rawMd5 = md5Hash(rawData);
+
+  // Generate AES key and filekey
+  const aesKeyBytes = crypto.randomBytes(16);
+  const aesKeyHex = aesKeyBytes.toString("hex");
+  const filekey = crypto.randomBytes(16).toString("hex");
+
+  // Encrypt file
+  const encrypted = aesEncrypt(rawData, aesKeyBytes);
+
+  // Map media type to API constant
+  const mediaTypeMap = { image: 1, video: 2, file: 3 } as const;
+  const apiMediaType = mediaTypeMap[mediaType];
+
+  // Get upload URL
+  const uploadEqp = await getUploadUrl(baseUrl, token, {
+    filekey,
+    media_type: apiMediaType,
+    to_user_id: to,
+    rawsize: rawData.length,
+    rawfilemd5: rawMd5,
+    filesize: encrypted.length,
+    aeskey: aesKeyHex,
+  });
+
+  // Upload encrypted file to CDN
+  const uploadUrl = `${CDN_UPLOAD_URL}?encrypted_query_param=${encodeURIComponent(uploadEqp)}&filekey=${encodeURIComponent(filekey)}`;
+  const uploadRes = await fetch(uploadUrl, {
+    method: "POST",
+    body: encrypted,
+    headers: { "Content-Type": "application/octet-stream" },
+  });
+  if (!uploadRes.ok) {
+    throw new Error(`CDN upload failed: HTTP ${uploadRes.status}`);
+  }
+
+  // Get download param from response header
+  const downloadEqp = uploadRes.headers.get("x-encrypted-param");
+  if (!downloadEqp) {
+    throw new Error("CDN upload did not return x-encrypted-param header");
+  }
+
+  // Build media item
+  const aesKeyBase64 = Buffer.from(aesKeyHex, "utf-8").toString("base64");
+  const mediaField: MediaField = {
+    encrypt_query_param: downloadEqp,
+    aes_key: aesKeyBase64,
+  };
+
+  let itemType: number;
+  let itemPayload: Record<string, unknown>;
+
+  if (mediaType === "image") {
+    itemType = MSG_ITEM_IMAGE;
+    itemPayload = {
+      image_item: { media: mediaField, aeskey: aesKeyHex },
+    };
+  } else if (mediaType === "video") {
+    itemType = MSG_ITEM_VIDEO;
+    itemPayload = {
+      video_item: {
+        media: mediaField,
+        video_size: rawData.length,
+        video_md5: rawMd5,
+      },
+    };
+  } else {
+    itemType = MSG_ITEM_FILE;
+    itemPayload = {
+      file_item: {
+        media: mediaField,
+        file_name: path.basename(filePath),
+        md5: rawMd5,
+        len: rawData.length,
+      },
+    };
+  }
+
+  const clientId = generateClientId();
+  await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/sendmessage",
+    body: JSON.stringify({
+      msg: {
+        from_user_id: "",
+        to_user_id: to,
+        client_id: clientId,
+        message_type: MSG_TYPE_BOT,
+        message_state: MSG_STATE_FINISH,
+        item_list: [{ type: itemType, ...itemPayload }],
+        context_token: contextToken,
+      },
+      base_info: { channel_version: CHANNEL_VERSION },
+    }),
+    token,
+    timeoutMs: 30_000,
+  });
+
+  return clientId;
+}
+
 // ── MCP Channel Server ──────────────────────────────────────────────────────
 
 const mcp = new Server(
@@ -559,6 +721,8 @@ const mcp = new Server(
       "Respond naturally in Chinese unless the user writes in another language.",
       "Keep replies concise — WeChat is a chat app, not an essay platform.",
       "Strip markdown formatting (WeChat doesn't render it). Use plain text.",
+      "Media messages arrive as [image: /path], [video: /path], [voice: /path], [file: /path]. Use the Read tool to view images.",
+      "To send media back, use wechat_send_media with a local file path and media_type (image/video/file).",
     ].join("\n"),
   },
 );
@@ -583,6 +747,33 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ["sender_id", "text"],
+      },
+    },
+    {
+      name: "wechat_send_media",
+      description:
+        "Send an image, video, or file to the WeChat user. Provide an absolute local file path.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          sender_id: {
+            type: "string",
+            description:
+              "The sender_id from the inbound <channel> tag (xxx@im.wechat format)",
+          },
+          file_path: {
+            type: "string",
+            description:
+              "Absolute path to the local file to send",
+          },
+          media_type: {
+            type: "string",
+            enum: ["image", "video", "file"],
+            description:
+              "Type of media: image (jpg/png/gif), video (mp4), or file (any)",
+          },
+        },
+        required: ["sender_id", "file_path", "media_type"],
       },
     },
   ],
@@ -629,6 +820,54 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
   }
+  if (req.params.name === "wechat_send_media") {
+    const { sender_id, file_path: filePath, media_type } = req.params.arguments as {
+      sender_id: string;
+      file_path: string;
+      media_type: "image" | "video" | "file";
+    };
+    if (!activeAccount) {
+      return {
+        content: [{ type: "text" as const, text: "error: not logged in" }],
+      };
+    }
+    const contextToken = getCachedContextToken(sender_id);
+    if (!contextToken) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `error: no context_token for ${sender_id}. The user may need to send a message first.`,
+          },
+        ],
+      };
+    }
+    if (!fs.existsSync(filePath)) {
+      return {
+        content: [
+          { type: "text" as const, text: `error: file not found: ${filePath}` },
+        ],
+      };
+    }
+    try {
+      await uploadAndSendMedia(
+        activeAccount.baseUrl,
+        activeAccount.token,
+        sender_id,
+        contextToken,
+        filePath,
+        media_type,
+      );
+      return { content: [{ type: "text" as const, text: "media sent" }] };
+    } catch (err) {
+      return {
+        content: [
+          { type: "text" as const, text: `send media failed: ${String(err)}` },
+        ],
+      };
+    }
+  }
+
   throw new Error(`unknown tool: ${req.params.name}`);
 });
 
