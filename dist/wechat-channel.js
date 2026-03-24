@@ -5,25 +5,43 @@ var __getProtoOf = Object.getPrototypeOf;
 var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
+function __accessProp(key) {
+  return this[key];
+}
+var __toESMCache_node;
+var __toESMCache_esm;
 var __toESM = (mod, isNodeMode, target) => {
+  var canCache = mod != null && typeof mod === "object";
+  if (canCache) {
+    var cache = isNodeMode ? __toESMCache_node ??= new WeakMap : __toESMCache_esm ??= new WeakMap;
+    var cached = cache.get(mod);
+    if (cached)
+      return cached;
+  }
   target = mod != null ? __create(__getProtoOf(mod)) : {};
   const to = isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target;
   for (let key of __getOwnPropNames(mod))
     if (!__hasOwnProp.call(to, key))
       __defProp(to, key, {
-        get: () => mod[key],
+        get: __accessProp.bind(mod, key),
         enumerable: true
       });
+  if (canCache)
+    cache.set(mod, to);
   return to;
 };
 var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
+var __returnValue = (v) => v;
+function __exportSetter(name, newValue) {
+  this[name] = __returnValue.bind(null, newValue);
+}
 var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, {
       get: all[name],
       enumerable: true,
       configurable: true,
-      set: (newValue) => all[name] = () => newValue
+      set: __exportSetter.bind(all, name)
     });
 };
 
@@ -6286,7 +6304,7 @@ var require_formats = __commonJS((exports) => {
   }
   var TIME = /^(\d\d):(\d\d):(\d\d(?:\.\d+)?)(z|([+-])(\d\d)(?::?(\d\d))?)?$/i;
   function getTime(strictTimeZone) {
-    return function time(str) {
+    return function time3(str) {
       const matches = TIME.exec(str);
       if (!matches)
         return false;
@@ -7518,6 +7536,7 @@ var require_main = __commonJS((exports, module) => {
 
 // wechat-channel.ts
 import crypto from "crypto";
+import { execSync } from "child_process";
 import fs from "fs";
 import path from "path";
 
@@ -15621,9 +15640,14 @@ async function doQRLogin(baseUrl) {
 }
 var MSG_TYPE_USER = 1;
 var MSG_ITEM_TEXT = 1;
+var MSG_ITEM_IMAGE = 2;
 var MSG_ITEM_VOICE = 3;
+var MSG_ITEM_FILE = 4;
+var MSG_ITEM_VIDEO = 5;
 var MSG_TYPE_BOT = 2;
 var MSG_STATE_FINISH = 2;
+var MEDIA_DIR = path.join(CREDENTIALS_DIR, "media");
+var CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c/download";
 function extractTextFromMessage(msg) {
   if (!msg.item_list?.length)
     return "";
@@ -15646,6 +15670,87 @@ ${text}`;
     }
   }
   return "";
+}
+async function downloadAndDecryptMedia(encryptQueryParam, aesKeyInput, aesKeyEncoding, ext) {
+  fs.mkdirSync(MEDIA_DIR, { recursive: true });
+  const url = `${CDN_BASE_URL}?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`;
+  const res = await fetch(url);
+  if (!res.ok)
+    throw new Error(`Media download failed: HTTP ${res.status}`);
+  const encrypted = Buffer.from(await res.arrayBuffer());
+  let key;
+  if (aesKeyEncoding === "base64") {
+    const hexKey = Buffer.from(aesKeyInput, "base64").toString("utf-8");
+    key = Buffer.from(hexKey, "hex");
+  } else {
+    key = Buffer.from(aesKeyInput, "hex");
+  }
+  const decipher = crypto.createDecipheriv("aes-128-ecb", key, null);
+  const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  const filename = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
+  const filepath = path.join(MEDIA_DIR, filename);
+  fs.writeFileSync(filepath, decrypted);
+  return filepath;
+}
+async function extractMediaFromItem(item) {
+  if (item.type === MSG_ITEM_IMAGE && item.image_item) {
+    const img = item.image_item;
+    const eqp = img.media?.encrypt_query_param;
+    const key = img.media?.aes_key || img.aeskey;
+    const encoding = img.media?.aes_key ? "base64" : "hex";
+    if (!eqp || !key)
+      return null;
+    const fp = await downloadAndDecryptMedia(eqp, key, encoding, "jpg");
+    return { mediaType: "image", filePath: fp, metadata: {} };
+  }
+  if (item.type === MSG_ITEM_VIDEO && item.video_item) {
+    const vid = item.video_item;
+    const eqp = vid.media?.encrypt_query_param;
+    const key = vid.media?.aes_key;
+    if (!eqp || !key)
+      return null;
+    const fp = await downloadAndDecryptMedia(eqp, key, "base64", "mp4");
+    return {
+      mediaType: "video",
+      filePath: fp,
+      metadata: {
+        duration: vid.play_length ?? 0,
+        size: vid.video_size ?? 0
+      }
+    };
+  }
+  if (item.type === MSG_ITEM_VOICE && item.voice_item?.media) {
+    const voice = item.voice_item;
+    const eqp = voice.media?.encrypt_query_param;
+    const key = voice.media?.aes_key;
+    if (!eqp || !key)
+      return null;
+    const fp = await downloadAndDecryptMedia(eqp, key, "base64", "silk");
+    return {
+      mediaType: "voice",
+      filePath: fp,
+      metadata: {
+        transcription: voice.text ?? ""
+      }
+    };
+  }
+  if (item.type === MSG_ITEM_FILE && item.file_item) {
+    const file = item.file_item;
+    const eqp = file.media?.encrypt_query_param;
+    const key = file.media?.aes_key;
+    if (!eqp || !key)
+      return null;
+    const ext = file.file_name?.split(".").pop() ?? "bin";
+    const fp = await downloadAndDecryptMedia(eqp, key, "base64", ext);
+    return {
+      mediaType: "file",
+      filePath: fp,
+      metadata: {
+        fileName: file.file_name ?? "unknown"
+      }
+    };
+  }
+  return null;
 }
 var contextTokenCache = new Map;
 function cacheContextToken(userId, token) {
@@ -15699,6 +15804,170 @@ async function sendTextMessage(baseUrl, token, to, text, contextToken) {
   });
   return clientId;
 }
+var CDN_UPLOAD_URL = "https://novac2c.cdn.weixin.qq.com/c2c/upload";
+async function getUploadUrl(baseUrl, token, params) {
+  const raw = await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/getuploadurl",
+    body: JSON.stringify({
+      ...params,
+      no_need_thumb: params.no_need_thumb ?? true,
+      base_info: { channel_version: CHANNEL_VERSION }
+    }),
+    token,
+    timeoutMs: 15000
+  });
+  const resp = JSON.parse(raw);
+  const eqp = resp.encrypted_query_param || resp.upload_param;
+  if (!eqp) {
+    throw new Error(`getuploadurl failed: ${raw}`);
+  }
+  return eqp;
+}
+function md5Hash(data) {
+  return crypto.createHash("md5").update(data).digest("hex");
+}
+function aesEncrypt(data, key) {
+  const cipher = crypto.createCipheriv("aes-128-ecb", key, null);
+  return Buffer.concat([cipher.update(data), cipher.final()]);
+}
+async function uploadToCdn(baseUrl, token, to, rawData, mediaTypeNum) {
+  const rawMd5 = md5Hash(rawData);
+  const aesKeyBytes = crypto.randomBytes(16);
+  const aesKeyHex = aesKeyBytes.toString("hex");
+  const filekey = crypto.randomBytes(16).toString("hex");
+  const encrypted = aesEncrypt(rawData, aesKeyBytes);
+  const uploadEqp = await getUploadUrl(baseUrl, token, {
+    filekey,
+    media_type: mediaTypeNum,
+    to_user_id: to,
+    rawsize: rawData.length,
+    rawfilemd5: rawMd5,
+    filesize: encrypted.length,
+    aeskey: aesKeyHex
+  });
+  const uploadUrl = `${CDN_UPLOAD_URL}?encrypted_query_param=${encodeURIComponent(uploadEqp)}&filekey=${encodeURIComponent(filekey)}`;
+  const uploadRes = await fetch(uploadUrl, {
+    method: "POST",
+    body: encrypted,
+    headers: { "Content-Type": "application/octet-stream" }
+  });
+  if (!uploadRes.ok) {
+    throw new Error(`CDN upload failed: HTTP ${uploadRes.status}`);
+  }
+  const downloadEqp = uploadRes.headers.get("x-encrypted-query-param");
+  if (!downloadEqp) {
+    throw new Error("CDN upload did not return x-encrypted-query-param header");
+  }
+  return {
+    downloadEqp,
+    aesKeyHex,
+    aesKeyBase64: Buffer.from(aesKeyHex, "utf-8").toString("base64")
+  };
+}
+function generateVideoThumbnail(videoPath) {
+  const thumbPath = path.join(MEDIA_DIR, `thumb-${Date.now()}.jpg`);
+  try {
+    fs.mkdirSync(MEDIA_DIR, { recursive: true });
+    execSync(`ffmpeg -y -i "${videoPath}" -vframes 1 -vf "scale=224:-1" "${thumbPath}"`, { stdio: "pipe", timeout: 1e4 });
+    const data = fs.readFileSync(thumbPath);
+    fs.unlinkSync(thumbPath);
+    return data;
+  } catch {
+    return null;
+  }
+}
+async function uploadAndSendMedia(baseUrl, token, to, contextToken, filePath, mediaType) {
+  const rawData = fs.readFileSync(filePath);
+  const rawMd5 = md5Hash(rawData);
+  const mediaTypeMap = { image: 1, video: 2, file: 3 };
+  const apiMediaType = mediaTypeMap[mediaType];
+  const main = await uploadToCdn(baseUrl, token, to, rawData, apiMediaType);
+  const mainMediaField = {
+    encrypt_query_param: main.downloadEqp,
+    aes_key: main.aesKeyBase64,
+    encrypt_type: 0
+  };
+  let itemType;
+  let itemPayload;
+  if (mediaType === "image") {
+    itemType = MSG_ITEM_IMAGE;
+    itemPayload = {
+      image_item: {
+        media: mainMediaField,
+        aeskey: main.aesKeyHex,
+        mid_size: rawData.length,
+        hd_size: rawData.length
+      }
+    };
+  } else if (mediaType === "video") {
+    itemType = MSG_ITEM_VIDEO;
+    const thumbData = generateVideoThumbnail(filePath);
+    let thumbPayload = {};
+    if (thumbData) {
+      try {
+        const thumb = await uploadToCdn(baseUrl, token, to, thumbData, 1);
+        thumbPayload = {
+          thumb_media: {
+            encrypt_query_param: thumb.downloadEqp,
+            aes_key: thumb.aesKeyBase64,
+            encrypt_type: 0
+          },
+          thumb_size: thumbData.length,
+          thumb_width: 224,
+          thumb_height: 398
+        };
+      } catch (err) {
+        logError(`\u7F29\u7565\u56FE\u4E0A\u4F20\u5931\u8D25: ${String(err)}`);
+      }
+    }
+    let playLength = 0;
+    try {
+      const durationStr = execSync(`ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${filePath}"`, { stdio: "pipe", timeout: 1e4 }).toString().trim();
+      playLength = Math.round(parseFloat(durationStr));
+    } catch {}
+    itemPayload = {
+      video_item: {
+        media: mainMediaField,
+        video_size: rawData.length,
+        play_length: playLength,
+        video_md5: rawMd5,
+        ...thumbPayload
+      }
+    };
+  } else {
+    itemType = MSG_ITEM_FILE;
+    itemPayload = {
+      file_item: {
+        media: mainMediaField,
+        file_name: path.basename(filePath),
+        md5: rawMd5,
+        len: String(rawData.length)
+      }
+    };
+  }
+  const clientId = generateClientId();
+  const sendBody = {
+    msg: {
+      from_user_id: "",
+      to_user_id: to,
+      client_id: clientId,
+      message_type: MSG_TYPE_BOT,
+      message_state: MSG_STATE_FINISH,
+      item_list: [{ type: itemType, ...itemPayload }],
+      context_token: contextToken
+    },
+    base_info: { channel_version: CHANNEL_VERSION }
+  };
+  await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/sendmessage",
+    body: JSON.stringify(sendBody),
+    token,
+    timeoutMs: 30000
+  });
+  return clientId;
+}
 var mcp = new Server({ name: CHANNEL_NAME, version: CHANNEL_VERSION }, {
   capabilities: {
     experimental: { "claude/channel": {} },
@@ -15710,7 +15979,9 @@ var mcp = new Server({ name: CHANNEL_NAME, version: CHANNEL_VERSION }, {
     "Messages are from real WeChat users via the WeChat ClawBot interface.",
     "Respond naturally in Chinese unless the user writes in another language.",
     "Keep replies concise \u2014 WeChat is a chat app, not an essay platform.",
-    "Strip markdown formatting (WeChat doesn't render it). Use plain text."
+    "Strip markdown formatting (WeChat doesn't render it). Use plain text.",
+    "Media messages arrive as [image: /path], [video: /path], [voice: /path], [file: /path]. Use the Read tool to view images.",
+    "To send media back, use wechat_send_media with a local file path and media_type (image/video/file)."
   ].join(`
 `)
 });
@@ -15732,6 +16003,29 @@ mcp.setRequestHandler(ListToolsRequestSchema2, async () => ({
           }
         },
         required: ["sender_id", "text"]
+      }
+    },
+    {
+      name: "wechat_send_media",
+      description: "Send an image, video, or file to the WeChat user. Provide an absolute local file path.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          sender_id: {
+            type: "string",
+            description: "The sender_id from the inbound <channel> tag (xxx@im.wechat format)"
+          },
+          file_path: {
+            type: "string",
+            description: "Absolute path to the local file to send"
+          },
+          media_type: {
+            type: "string",
+            enum: ["image", "video", "file"],
+            description: "Type of media: image (jpg/png/gif), video (mp4), or file (any)"
+          }
+        },
+        required: ["sender_id", "file_path", "media_type"]
       }
     }
   ]
@@ -15763,6 +16057,42 @@ mcp.setRequestHandler(CallToolRequestSchema2, async (req) => {
       return {
         content: [
           { type: "text", text: `send failed: ${String(err)}` }
+        ]
+      };
+    }
+  }
+  if (req.params.name === "wechat_send_media") {
+    const { sender_id, file_path: filePath, media_type } = req.params.arguments;
+    if (!activeAccount) {
+      return {
+        content: [{ type: "text", text: "error: not logged in" }]
+      };
+    }
+    const contextToken = getCachedContextToken(sender_id);
+    if (!contextToken) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `error: no context_token for ${sender_id}. The user may need to send a message first.`
+          }
+        ]
+      };
+    }
+    if (!fs.existsSync(filePath)) {
+      return {
+        content: [
+          { type: "text", text: `error: file not found: ${filePath}` }
+        ]
+      };
+    }
+    try {
+      await uploadAndSendMedia(activeAccount.baseUrl, activeAccount.token, sender_id, contextToken, filePath, media_type);
+      return { content: [{ type: "text", text: "media sent" }] };
+    } catch (err) {
+      return {
+        content: [
+          { type: "text", text: `send media failed: ${String(err)}` }
         ]
       };
     }
@@ -15807,18 +16137,38 @@ async function startPolling(account) {
       for (const msg of resp.msgs ?? []) {
         if (msg.message_type !== MSG_TYPE_USER)
           continue;
-        const text = extractTextFromMessage(msg);
-        if (!text)
-          continue;
         const senderId = msg.from_user_id ?? "unknown";
         if (msg.context_token) {
           cacheContextToken(senderId, msg.context_token);
         }
-        log(`\u6536\u5230\u6D88\u606F: from=${senderId} text=${text.slice(0, 50)}...`);
+        const text = extractTextFromMessage(msg);
+        const mediaResults = [];
+        for (const item of msg.item_list ?? []) {
+          try {
+            const media = await extractMediaFromItem(item);
+            if (media)
+              mediaResults.push(media);
+          } catch (err) {
+            logError(`\u5A92\u4F53\u4E0B\u8F7D\u5931\u8D25: ${String(err)}`);
+          }
+        }
+        if (!text && mediaResults.length === 0)
+          continue;
+        const parts = [];
+        if (text)
+          parts.push(text);
+        for (const m of mediaResults) {
+          const metaEntries = Object.entries(m.metadata).filter(([, v]) => v !== "" && v !== 0).map(([k, v]) => `${k}=${v}`);
+          const metaStr = metaEntries.length ? ` (${metaEntries.join(", ")})` : "";
+          parts.push(`[${m.mediaType}: ${m.filePath}${metaStr}]`);
+        }
+        const content = parts.join(`
+`);
+        log(`\u6536\u5230\u6D88\u606F: from=${senderId} content=${content.slice(0, 80)}...`);
         await mcp.notification({
           method: "notifications/claude/channel",
           params: {
-            content: text,
+            content,
             meta: {
               sender: senderId.split("@")[0] || senderId,
               sender_id: senderId

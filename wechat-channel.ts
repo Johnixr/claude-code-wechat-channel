@@ -13,6 +13,7 @@
  */
 
 import crypto from "node:crypto";
+import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -265,10 +266,53 @@ interface RefMessage {
   title?: string;
 }
 
+interface MediaField {
+  encrypt_query_param?: string;
+  aes_key?: string; // base64-encoded hex key
+}
+
+interface ImageItem {
+  url?: string;
+  aeskey?: string; // hex-encoded
+  media?: MediaField;
+  mid_size?: number;
+  thumb_size?: number;
+  thumb_height?: number;
+  thumb_width?: number;
+  hd_size?: number;
+}
+
+interface VideoItem {
+  media?: MediaField;
+  video_size?: number;
+  play_length?: number;
+  video_md5?: string;
+  thumb_media?: MediaField;
+  thumb_size?: number;
+  thumb_height?: number;
+  thumb_width?: number;
+}
+
+interface VoiceItemFull {
+  text?: string;
+  media?: MediaField;
+  playtime?: number;
+}
+
+interface FileItem {
+  media?: MediaField;
+  file_name?: string;
+  md5?: string;
+  len?: number;
+}
+
 interface MessageItem {
   type?: number;
   text_item?: TextItem;
-  voice_item?: { text?: string };
+  voice_item?: VoiceItemFull;
+  image_item?: ImageItem;
+  video_item?: VideoItem;
+  file_item?: FileItem;
   ref_msg?: RefMessage;
 }
 
@@ -296,9 +340,16 @@ interface GetUpdatesResp {
 // Message type constants
 const MSG_TYPE_USER = 1;
 const MSG_ITEM_TEXT = 1;
+const MSG_ITEM_IMAGE = 2;
 const MSG_ITEM_VOICE = 3;
+const MSG_ITEM_FILE = 4;
+const MSG_ITEM_VIDEO = 5;
 const MSG_TYPE_BOT = 2;
 const MSG_STATE_FINISH = 2;
+
+// Media download config
+const MEDIA_DIR = path.join(CREDENTIALS_DIR, "media");
+const CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c/download";
 
 function extractTextFromMessage(msg: WeixinMessage): string {
   if (!msg.item_list?.length) return "";
@@ -317,6 +368,108 @@ function extractTextFromMessage(msg: WeixinMessage): string {
     }
   }
   return "";
+}
+
+// ── Media Download & Decrypt ─────────────────────────────────────────────────
+
+async function downloadAndDecryptMedia(
+  encryptQueryParam: string,
+  aesKeyInput: string,
+  aesKeyEncoding: "hex" | "base64",
+  ext: string,
+): Promise<string> {
+  fs.mkdirSync(MEDIA_DIR, { recursive: true });
+
+  const url = `${CDN_BASE_URL}?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Media download failed: HTTP ${res.status}`);
+  const encrypted = Buffer.from(await res.arrayBuffer());
+
+  // Normalize AES key to 16-byte Buffer
+  let key: Buffer;
+  if (aesKeyEncoding === "base64") {
+    // base64 encodes the hex string, so decode base64 first to get hex, then hex to bytes
+    const hexKey = Buffer.from(aesKeyInput, "base64").toString("utf-8");
+    key = Buffer.from(hexKey, "hex");
+  } else {
+    key = Buffer.from(aesKeyInput, "hex");
+  }
+
+  const decipher = crypto.createDecipheriv("aes-128-ecb", key, null);
+  const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+
+  const filename = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
+  const filepath = path.join(MEDIA_DIR, filename);
+  fs.writeFileSync(filepath, decrypted);
+
+  return filepath;
+}
+
+interface MediaResult {
+  mediaType: "image" | "video" | "voice" | "file";
+  filePath: string;
+  metadata: Record<string, string | number>;
+}
+
+async function extractMediaFromItem(item: MessageItem): Promise<MediaResult | null> {
+  if (item.type === MSG_ITEM_IMAGE && item.image_item) {
+    const img = item.image_item;
+    const eqp = img.media?.encrypt_query_param;
+    const key = img.media?.aes_key || img.aeskey;
+    const encoding: "hex" | "base64" = img.media?.aes_key ? "base64" : "hex";
+    if (!eqp || !key) return null;
+    const fp = await downloadAndDecryptMedia(eqp, key, encoding, "jpg");
+    return { mediaType: "image", filePath: fp, metadata: {} };
+  }
+
+  if (item.type === MSG_ITEM_VIDEO && item.video_item) {
+    const vid = item.video_item;
+    const eqp = vid.media?.encrypt_query_param;
+    const key = vid.media?.aes_key;
+    if (!eqp || !key) return null;
+    const fp = await downloadAndDecryptMedia(eqp, key, "base64", "mp4");
+    return {
+      mediaType: "video",
+      filePath: fp,
+      metadata: {
+        duration: vid.play_length ?? 0,
+        size: vid.video_size ?? 0,
+      },
+    };
+  }
+
+  if (item.type === MSG_ITEM_VOICE && item.voice_item?.media) {
+    const voice = item.voice_item;
+    const eqp = voice.media?.encrypt_query_param;
+    const key = voice.media?.aes_key;
+    if (!eqp || !key) return null;
+    const fp = await downloadAndDecryptMedia(eqp, key, "base64", "silk");
+    return {
+      mediaType: "voice",
+      filePath: fp,
+      metadata: {
+        transcription: voice.text ?? "",
+      },
+    };
+  }
+
+  if (item.type === MSG_ITEM_FILE && item.file_item) {
+    const file = item.file_item;
+    const eqp = file.media?.encrypt_query_param;
+    const key = file.media?.aes_key;
+    if (!eqp || !key) return null;
+    const ext = file.file_name?.split(".").pop() ?? "bin";
+    const fp = await downloadAndDecryptMedia(eqp, key, "base64", ext);
+    return {
+      mediaType: "file",
+      filePath: fp,
+      metadata: {
+        fileName: file.file_name ?? "unknown",
+      },
+    };
+  }
+
+  return null;
 }
 
 // ── Context Token Cache ──────────────────────────────────────────────────────
@@ -391,6 +544,246 @@ async function sendTextMessage(
   return clientId;
 }
 
+// ── Media Upload & Send ──────────────────────────────────────────────────────
+
+const CDN_UPLOAD_URL = "https://novac2c.cdn.weixin.qq.com/c2c/upload";
+
+interface UploadUrlResponse {
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
+  encrypted_query_param?: string;
+  upload_param?: string;
+}
+
+async function getUploadUrl(
+  baseUrl: string,
+  token: string,
+  params: {
+    filekey: string;
+    media_type: number; // 1=image, 2=video, 3=file, 4=voice
+    to_user_id: string;
+    rawsize: number;
+    rawfilemd5: string;
+    filesize: number;
+    aeskey: string;
+    no_need_thumb?: boolean;
+  },
+): Promise<string> {
+  const raw = await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/getuploadurl",
+    body: JSON.stringify({
+      ...params,
+      no_need_thumb: params.no_need_thumb ?? true,
+      base_info: { channel_version: CHANNEL_VERSION },
+    }),
+    token,
+    timeoutMs: 15_000,
+  });
+  const resp = JSON.parse(raw) as UploadUrlResponse;
+  const eqp = resp.encrypted_query_param || resp.upload_param;
+  if (!eqp) {
+    throw new Error(`getuploadurl failed: ${raw}`);
+  }
+  return eqp;
+}
+
+function md5Hash(data: Buffer): string {
+  return crypto.createHash("md5").update(data).digest("hex");
+}
+
+function aesEncrypt(data: Buffer, key: Buffer): Buffer {
+  const cipher = crypto.createCipheriv("aes-128-ecb", key, null);
+  return Buffer.concat([cipher.update(data), cipher.final()]);
+}
+
+interface CdnUploadResult {
+  downloadEqp: string;
+  aesKeyHex: string;
+  aesKeyBase64: string;
+}
+
+async function uploadToCdn(
+  baseUrl: string,
+  token: string,
+  to: string,
+  rawData: Buffer,
+  mediaTypeNum: number,
+): Promise<CdnUploadResult> {
+  const rawMd5 = md5Hash(rawData);
+  const aesKeyBytes = crypto.randomBytes(16);
+  const aesKeyHex = aesKeyBytes.toString("hex");
+  const filekey = crypto.randomBytes(16).toString("hex");
+  const encrypted = aesEncrypt(rawData, aesKeyBytes);
+
+  const uploadEqp = await getUploadUrl(baseUrl, token, {
+    filekey,
+    media_type: mediaTypeNum,
+    to_user_id: to,
+    rawsize: rawData.length,
+    rawfilemd5: rawMd5,
+    filesize: encrypted.length,
+    aeskey: aesKeyHex,
+  });
+
+  const uploadUrl = `${CDN_UPLOAD_URL}?encrypted_query_param=${encodeURIComponent(uploadEqp)}&filekey=${encodeURIComponent(filekey)}`;
+  const uploadRes = await fetch(uploadUrl, {
+    method: "POST",
+    body: encrypted,
+    headers: { "Content-Type": "application/octet-stream" },
+  });
+  if (!uploadRes.ok) {
+    throw new Error(`CDN upload failed: HTTP ${uploadRes.status}`);
+  }
+
+  const downloadEqp = uploadRes.headers.get("x-encrypted-query-param");
+  if (!downloadEqp) {
+    throw new Error("CDN upload did not return x-encrypted-query-param header");
+  }
+
+  return {
+    downloadEqp,
+    aesKeyHex,
+    aesKeyBase64: Buffer.from(aesKeyHex, "utf-8").toString("base64"),
+  };
+}
+
+function generateVideoThumbnail(videoPath: string): Buffer | null {
+  const thumbPath = path.join(MEDIA_DIR, `thumb-${Date.now()}.jpg`);
+  try {
+    fs.mkdirSync(MEDIA_DIR, { recursive: true });
+    execSync(
+      `ffmpeg -y -i "${videoPath}" -vframes 1 -vf "scale=224:-1" "${thumbPath}"`,
+      { stdio: "pipe", timeout: 10_000 },
+    );
+    const data = fs.readFileSync(thumbPath);
+    fs.unlinkSync(thumbPath);
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+async function uploadAndSendMedia(
+  baseUrl: string,
+  token: string,
+  to: string,
+  contextToken: string,
+  filePath: string,
+  mediaType: "image" | "video" | "file",
+): Promise<string> {
+  const rawData = fs.readFileSync(filePath);
+  const rawMd5 = md5Hash(rawData);
+
+  // Map media type to API constant
+  const mediaTypeMap = { image: 1, video: 2, file: 3 } as const;
+  const apiMediaType = mediaTypeMap[mediaType];
+
+  // Upload main file to CDN
+  const main = await uploadToCdn(baseUrl, token, to, rawData, apiMediaType);
+
+  const mainMediaField = {
+    encrypt_query_param: main.downloadEqp,
+    aes_key: main.aesKeyBase64,
+    encrypt_type: 0,
+  };
+
+  let itemType: number;
+  let itemPayload: Record<string, unknown>;
+
+  if (mediaType === "image") {
+    itemType = MSG_ITEM_IMAGE;
+    itemPayload = {
+      image_item: {
+        media: mainMediaField,
+        aeskey: main.aesKeyHex,
+        mid_size: rawData.length,
+        hd_size: rawData.length,
+      },
+    };
+  } else if (mediaType === "video") {
+    itemType = MSG_ITEM_VIDEO;
+
+    // Generate and upload thumbnail
+    const thumbData = generateVideoThumbnail(filePath);
+    let thumbPayload: Record<string, unknown> = {};
+
+    if (thumbData) {
+      try {
+        const thumb = await uploadToCdn(baseUrl, token, to, thumbData, 1); // upload as image
+        thumbPayload = {
+          thumb_media: {
+            encrypt_query_param: thumb.downloadEqp,
+            aes_key: thumb.aesKeyBase64,
+            encrypt_type: 0,
+          },
+          thumb_size: thumbData.length,
+          thumb_width: 224,
+          thumb_height: 398,
+        };
+      } catch (err) {
+        logError(`缩略图上传失败: ${String(err)}`);
+      }
+    }
+
+    // Get video duration with ffprobe
+    let playLength = 0;
+    try {
+      const durationStr = execSync(
+        `ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${filePath}"`,
+        { stdio: "pipe", timeout: 10_000 },
+      ).toString().trim();
+      playLength = Math.round(parseFloat(durationStr));
+    } catch {
+      // ignore
+    }
+
+    itemPayload = {
+      video_item: {
+        media: mainMediaField,
+        video_size: rawData.length,
+        play_length: playLength,
+        video_md5: rawMd5,
+        ...thumbPayload,
+      },
+    };
+  } else {
+    itemType = MSG_ITEM_FILE;
+    itemPayload = {
+      file_item: {
+        media: mainMediaField,
+        file_name: path.basename(filePath),
+        md5: rawMd5,
+        len: String(rawData.length),
+      },
+    };
+  }
+
+  const clientId = generateClientId();
+  const sendBody = {
+    msg: {
+      from_user_id: "",
+      to_user_id: to,
+      client_id: clientId,
+      message_type: MSG_TYPE_BOT,
+      message_state: MSG_STATE_FINISH,
+      item_list: [{ type: itemType, ...itemPayload }],
+      context_token: contextToken,
+    },
+    base_info: { channel_version: CHANNEL_VERSION },
+  };
+  await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/sendmessage",
+    body: JSON.stringify(sendBody),
+    token,
+    timeoutMs: 30_000,
+  });
+
+  return clientId;
+}
+
 // ── MCP Channel Server ──────────────────────────────────────────────────────
 
 const mcp = new Server(
@@ -407,6 +800,8 @@ const mcp = new Server(
       "Respond naturally in Chinese unless the user writes in another language.",
       "Keep replies concise — WeChat is a chat app, not an essay platform.",
       "Strip markdown formatting (WeChat doesn't render it). Use plain text.",
+      "Media messages arrive as [image: /path], [video: /path], [voice: /path], [file: /path]. Use the Read tool to view images.",
+      "To send media back, use wechat_send_media with a local file path and media_type (image/video/file).",
     ].join("\n"),
   },
 );
@@ -431,6 +826,33 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ["sender_id", "text"],
+      },
+    },
+    {
+      name: "wechat_send_media",
+      description:
+        "Send an image, video, or file to the WeChat user. Provide an absolute local file path.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          sender_id: {
+            type: "string",
+            description:
+              "The sender_id from the inbound <channel> tag (xxx@im.wechat format)",
+          },
+          file_path: {
+            type: "string",
+            description:
+              "Absolute path to the local file to send",
+          },
+          media_type: {
+            type: "string",
+            enum: ["image", "video", "file"],
+            description:
+              "Type of media: image (jpg/png/gif), video (mp4), or file (any)",
+          },
+        },
+        required: ["sender_id", "file_path", "media_type"],
       },
     },
   ],
@@ -477,6 +899,54 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
   }
+  if (req.params.name === "wechat_send_media") {
+    const { sender_id, file_path: filePath, media_type } = req.params.arguments as {
+      sender_id: string;
+      file_path: string;
+      media_type: "image" | "video" | "file";
+    };
+    if (!activeAccount) {
+      return {
+        content: [{ type: "text" as const, text: "error: not logged in" }],
+      };
+    }
+    const contextToken = getCachedContextToken(sender_id);
+    if (!contextToken) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `error: no context_token for ${sender_id}. The user may need to send a message first.`,
+          },
+        ],
+      };
+    }
+    if (!fs.existsSync(filePath)) {
+      return {
+        content: [
+          { type: "text" as const, text: `error: file not found: ${filePath}` },
+        ],
+      };
+    }
+    try {
+      await uploadAndSendMedia(
+        activeAccount.baseUrl,
+        activeAccount.token,
+        sender_id,
+        contextToken,
+        filePath,
+        media_type,
+      );
+      return { content: [{ type: "text" as const, text: "media sent" }] };
+    } catch (err) {
+      return {
+        content: [
+          { type: "text" as const, text: `send media failed: ${String(err)}` },
+        ],
+      };
+    }
+  }
+
   throw new Error(`unknown tool: ${req.params.name}`);
 });
 
@@ -542,9 +1012,6 @@ async function startPolling(account: AccountData): Promise<never> {
         // Only process user messages (not bot messages)
         if (msg.message_type !== MSG_TYPE_USER) continue;
 
-        const text = extractTextFromMessage(msg);
-        if (!text) continue;
-
         const senderId = msg.from_user_id ?? "unknown";
 
         // Cache context token for reply
@@ -552,13 +1019,41 @@ async function startPolling(account: AccountData): Promise<never> {
           cacheContextToken(senderId, msg.context_token);
         }
 
-        log(`收到消息: from=${senderId} text=${text.slice(0, 50)}...`);
+        const text = extractTextFromMessage(msg);
+
+        // Extract media from all items
+        const mediaResults: MediaResult[] = [];
+        for (const item of msg.item_list ?? []) {
+          try {
+            const media = await extractMediaFromItem(item);
+            if (media) mediaResults.push(media);
+          } catch (err) {
+            logError(`媒体下载失败: ${String(err)}`);
+          }
+        }
+
+        // Skip if nothing extracted
+        if (!text && mediaResults.length === 0) continue;
+
+        // Build content string
+        const parts: string[] = [];
+        if (text) parts.push(text);
+        for (const m of mediaResults) {
+          const metaEntries = Object.entries(m.metadata)
+            .filter(([, v]) => v !== "" && v !== 0)
+            .map(([k, v]) => `${k}=${v}`);
+          const metaStr = metaEntries.length ? ` (${metaEntries.join(", ")})` : "";
+          parts.push(`[${m.mediaType}: ${m.filePath}${metaStr}]`);
+        }
+
+        const content = parts.join("\n");
+        log(`收到消息: from=${senderId} content=${content.slice(0, 80)}...`);
 
         // Push to Claude Code session
         await mcp.notification({
           method: "notifications/claude/channel",
           params: {
-            content: text,
+            content,
             meta: {
               sender: senderId.split("@")[0] || senderId,
               sender_id: senderId,
