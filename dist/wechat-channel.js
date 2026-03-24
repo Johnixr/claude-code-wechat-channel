@@ -5,25 +5,43 @@ var __getProtoOf = Object.getPrototypeOf;
 var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
+function __accessProp(key) {
+  return this[key];
+}
+var __toESMCache_node;
+var __toESMCache_esm;
 var __toESM = (mod, isNodeMode, target) => {
+  var canCache = mod != null && typeof mod === "object";
+  if (canCache) {
+    var cache = isNodeMode ? __toESMCache_node ??= new WeakMap : __toESMCache_esm ??= new WeakMap;
+    var cached = cache.get(mod);
+    if (cached)
+      return cached;
+  }
   target = mod != null ? __create(__getProtoOf(mod)) : {};
   const to = isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target;
   for (let key of __getOwnPropNames(mod))
     if (!__hasOwnProp.call(to, key))
       __defProp(to, key, {
-        get: () => mod[key],
+        get: __accessProp.bind(mod, key),
         enumerable: true
       });
+  if (canCache)
+    cache.set(mod, to);
   return to;
 };
 var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
+var __returnValue = (v) => v;
+function __exportSetter(name, newValue) {
+  this[name] = __returnValue.bind(null, newValue);
+}
 var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, {
       get: all[name],
       enumerable: true,
       configurable: true,
-      set: (newValue) => all[name] = () => newValue
+      set: __exportSetter.bind(all, name)
     });
 };
 
@@ -6286,7 +6304,7 @@ var require_formats = __commonJS((exports) => {
   }
   var TIME = /^(\d\d):(\d\d):(\d\d(?:\.\d+)?)(z|([+-])(\d\d)(?::?(\d\d))?)?$/i;
   function getTime(strictTimeZone) {
-    return function time(str) {
+    return function time3(str) {
       const matches = TIME.exec(str);
       if (!matches)
         return false;
@@ -15621,9 +15639,14 @@ async function doQRLogin(baseUrl) {
 }
 var MSG_TYPE_USER = 1;
 var MSG_ITEM_TEXT = 1;
+var MSG_ITEM_IMAGE = 2;
 var MSG_ITEM_VOICE = 3;
+var MSG_ITEM_FILE = 4;
+var MSG_ITEM_VIDEO = 5;
 var MSG_TYPE_BOT = 2;
 var MSG_STATE_FINISH = 2;
+var MEDIA_DIR = path.join(CREDENTIALS_DIR, "media");
+var CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c/download";
 function extractTextFromMessage(msg) {
   if (!msg.item_list?.length)
     return "";
@@ -15646,6 +15669,87 @@ ${text}`;
     }
   }
   return "";
+}
+async function downloadAndDecryptMedia(encryptQueryParam, aesKeyInput, aesKeyEncoding, ext) {
+  fs.mkdirSync(MEDIA_DIR, { recursive: true });
+  const url = `${CDN_BASE_URL}?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`;
+  const res = await fetch(url);
+  if (!res.ok)
+    throw new Error(`Media download failed: HTTP ${res.status}`);
+  const encrypted = Buffer.from(await res.arrayBuffer());
+  let key;
+  if (aesKeyEncoding === "base64") {
+    const hexKey = Buffer.from(aesKeyInput, "base64").toString("utf-8");
+    key = Buffer.from(hexKey, "hex");
+  } else {
+    key = Buffer.from(aesKeyInput, "hex");
+  }
+  const decipher = crypto.createDecipheriv("aes-128-ecb", key, null);
+  const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  const filename = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
+  const filepath = path.join(MEDIA_DIR, filename);
+  fs.writeFileSync(filepath, decrypted);
+  return filepath;
+}
+async function extractMediaFromItem(item) {
+  if (item.type === MSG_ITEM_IMAGE && item.image_item) {
+    const img = item.image_item;
+    const eqp = img.media?.encrypt_query_param;
+    const key = img.media?.aes_key || img.aeskey;
+    const encoding = img.media?.aes_key ? "base64" : "hex";
+    if (!eqp || !key)
+      return null;
+    const fp = await downloadAndDecryptMedia(eqp, key, encoding, "jpg");
+    return { mediaType: "image", filePath: fp, metadata: {} };
+  }
+  if (item.type === MSG_ITEM_VIDEO && item.video_item) {
+    const vid = item.video_item;
+    const eqp = vid.media?.encrypt_query_param;
+    const key = vid.media?.aes_key;
+    if (!eqp || !key)
+      return null;
+    const fp = await downloadAndDecryptMedia(eqp, key, "base64", "mp4");
+    return {
+      mediaType: "video",
+      filePath: fp,
+      metadata: {
+        duration: vid.play_length ?? 0,
+        size: vid.video_size ?? 0
+      }
+    };
+  }
+  if (item.type === MSG_ITEM_VOICE && item.voice_item?.media) {
+    const voice = item.voice_item;
+    const eqp = voice.media?.encrypt_query_param;
+    const key = voice.media?.aes_key;
+    if (!eqp || !key)
+      return null;
+    const fp = await downloadAndDecryptMedia(eqp, key, "base64", "silk");
+    return {
+      mediaType: "voice",
+      filePath: fp,
+      metadata: {
+        transcription: voice.text ?? ""
+      }
+    };
+  }
+  if (item.type === MSG_ITEM_FILE && item.file_item) {
+    const file = item.file_item;
+    const eqp = file.media?.encrypt_query_param;
+    const key = file.media?.aes_key;
+    if (!eqp || !key)
+      return null;
+    const ext = file.file_name?.split(".").pop() ?? "bin";
+    const fp = await downloadAndDecryptMedia(eqp, key, "base64", ext);
+    return {
+      mediaType: "file",
+      filePath: fp,
+      metadata: {
+        fileName: file.file_name ?? "unknown"
+      }
+    };
+  }
+  return null;
 }
 var contextTokenCache = new Map;
 function cacheContextToken(userId, token) {
@@ -15807,18 +15911,38 @@ async function startPolling(account) {
       for (const msg of resp.msgs ?? []) {
         if (msg.message_type !== MSG_TYPE_USER)
           continue;
-        const text = extractTextFromMessage(msg);
-        if (!text)
-          continue;
         const senderId = msg.from_user_id ?? "unknown";
         if (msg.context_token) {
           cacheContextToken(senderId, msg.context_token);
         }
-        log(`\u6536\u5230\u6D88\u606F: from=${senderId} text=${text.slice(0, 50)}...`);
+        const text = extractTextFromMessage(msg);
+        const mediaResults = [];
+        for (const item of msg.item_list ?? []) {
+          try {
+            const media = await extractMediaFromItem(item);
+            if (media)
+              mediaResults.push(media);
+          } catch (err) {
+            logError(`\u5A92\u4F53\u4E0B\u8F7D\u5931\u8D25: ${String(err)}`);
+          }
+        }
+        if (!text && mediaResults.length === 0)
+          continue;
+        const parts = [];
+        if (text)
+          parts.push(text);
+        for (const m of mediaResults) {
+          const metaEntries = Object.entries(m.metadata).filter(([, v]) => v !== "" && v !== 0).map(([k, v]) => `${k}=${v}`);
+          const metaStr = metaEntries.length ? ` (${metaEntries.join(", ")})` : "";
+          parts.push(`[${m.mediaType}: ${m.filePath}${metaStr}]`);
+        }
+        const content = parts.join(`
+`);
+        log(`\u6536\u5230\u6D88\u606F: from=${senderId} content=${content.slice(0, 80)}...`);
         await mcp.notification({
           method: "notifications/claude/channel",
           params: {
-            content: text,
+            content,
             meta: {
               sender: senderId.split("@")[0] || senderId,
               sender_id: senderId
