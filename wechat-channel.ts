@@ -552,6 +552,7 @@ interface UploadUrlResponse {
   errcode?: number;
   errmsg?: string;
   encrypted_query_param?: string;
+  upload_param?: string;
 }
 
 async function getUploadUrl(
@@ -580,10 +581,11 @@ async function getUploadUrl(
     timeoutMs: 15_000,
   });
   const resp = JSON.parse(raw) as UploadUrlResponse;
-  if (!resp.encrypted_query_param) {
+  const eqp = resp.encrypted_query_param || resp.upload_param;
+  if (!eqp) {
     throw new Error(`getuploadurl failed: ${raw}`);
   }
-  return resp.encrypted_query_param;
+  return eqp;
 }
 
 function md5Hash(data: Buffer): string {
@@ -641,16 +643,17 @@ async function uploadAndSendMedia(
   }
 
   // Get download param from response header
-  const downloadEqp = uploadRes.headers.get("x-encrypted-param");
+  const downloadEqp = uploadRes.headers.get("x-encrypted-query-param");
   if (!downloadEqp) {
-    throw new Error("CDN upload did not return x-encrypted-param header");
+    throw new Error("CDN upload did not return x-encrypted-query-param header");
   }
 
   // Build media item
   const aesKeyBase64 = Buffer.from(aesKeyHex, "utf-8").toString("base64");
-  const mediaField: MediaField = {
+  const mediaField = {
     encrypt_query_param: downloadEqp,
     aes_key: aesKeyBase64,
+    encrypt_type: 0,
   };
 
   let itemType: number;
@@ -659,7 +662,12 @@ async function uploadAndSendMedia(
   if (mediaType === "image") {
     itemType = MSG_ITEM_IMAGE;
     itemPayload = {
-      image_item: { media: mediaField, aeskey: aesKeyHex },
+      image_item: {
+        media: mediaField,
+        aeskey: aesKeyHex,
+        mid_size: rawData.length,
+        hd_size: rawData.length,
+      },
     };
   } else if (mediaType === "video") {
     itemType = MSG_ITEM_VIDEO;
@@ -677,7 +685,7 @@ async function uploadAndSendMedia(
         media: mediaField,
         file_name: path.basename(filePath),
         md5: rawMd5,
-        len: rawData.length,
+        len: String(rawData.length),
       },
     };
   }
