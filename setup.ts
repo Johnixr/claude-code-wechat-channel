@@ -99,6 +99,12 @@ async function main() {
   const qrResp = await fetchQRCode(DEFAULT_BASE_URL);
 
   // Display QR code
+  // Always print the raw URL first so it's accessible even if terminal rendering fails.
+  // In some environments (e.g. Claude Code's built-in terminal, piped output, or
+  // non-UTF-8 locales) qrcode-terminal's block characters render as garbled bytes.
+  // The URL lets users scan via browser, WeChat's "Scan from album", or any QR tool.
+  console.log(`扫码链接（可复制到浏览器或用"从相册选取"扫描）:\n${qrResp.qrcode_img_content}\n`);
+
   try {
     const qrterm = await import("qrcode-terminal");
     await new Promise<void>((resolve) => {
@@ -112,10 +118,10 @@ async function main() {
       );
     });
   } catch {
-    console.log(`请在浏览器中打开此链接扫码: ${qrResp.qrcode_img_content}\n`);
+    // qrcode-terminal unavailable — URL above is sufficient
   }
 
-  console.log("请用微信扫描上方二维码...\n");
+  console.log("请用微信扫描上方二维码（或复制链接到浏览器打开）...\n");
 
   const deadline = Date.now() + 480_000;
   let scannedPrinted = false;

@@ -8,8 +8,9 @@
  * Flow:
  *   1. QR login via ilink/bot/get_bot_qrcode + get_qrcode_status
  *   2. Long-poll ilink/bot/getupdates for incoming WeChat messages
- *   3. Forward messages to Claude Code as <channel> events
- *   4. Expose a reply tool so Claude can send messages back via ilink/bot/sendmessage
+ *   3. On each inbound message: send typing indicator via getconfig + sendtyping
+ *   4. Forward messages to Claude Code as <channel> events (text, voice, image, file, video, group)
+ *   5. Expose tools so Claude can reply (text) or send images back
  */
 
 import crypto from "node:crypto";
@@ -26,8 +27,9 @@ import {
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const CHANNEL_NAME = "wechat";
-const CHANNEL_VERSION = "0.1.0";
+const CHANNEL_VERSION = "0.2.0";
 const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
+const CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
 const BOT_TYPE = "3";
 const CREDENTIALS_DIR = path.join(
   process.env.HOME || "~",
@@ -81,7 +83,7 @@ function saveCredentials(data: AccountData): void {
   }
 }
 
-// ── WeChat ilink API ─────────────────────────────────────────────────────────
+// ── WeChat ilink API helpers ──────────────────────────────────────────────────
 
 function randomWechatUin(): string {
   const uint32 = crypto.randomBytes(4).readUInt32BE(0);
@@ -131,6 +133,148 @@ async function apiFetch(params: {
   } catch (err) {
     clearTimeout(timer);
     throw err;
+  }
+}
+
+// ── AES-128-ECB crypto (for CDN media) ───────────────────────────────────────
+
+function decryptAesEcb(data: Buffer, keyBase64: string): Buffer {
+  const key = Buffer.from(keyBase64, "base64");
+  const decipher = crypto.createDecipheriv("aes-128-ecb", key, null);
+  decipher.setAutoPadding(true);
+  return Buffer.concat([decipher.update(data), decipher.final()]);
+}
+
+function encryptAesEcb(data: Buffer, key: Buffer): Buffer {
+  const cipher = crypto.createCipheriv("aes-128-ecb", key, null);
+  cipher.setAutoPadding(true);
+  return Buffer.concat([cipher.update(data), cipher.final()]);
+}
+
+// ── CDN media download + decrypt ─────────────────────────────────────────────
+
+async function downloadAndDecryptMedia(
+  cdnUrl: string,
+  aesKeyBase64: string,
+): Promise<Buffer> {
+  const res = await fetch(cdnUrl, { signal: AbortSignal.timeout(30_000) });
+  if (!res.ok) throw new Error(`CDN download failed: ${res.status}`);
+  const encrypted = Buffer.from(await res.arrayBuffer());
+  return decryptAesEcb(encrypted, aesKeyBase64);
+}
+
+// ── CDN media upload (for sending images / files) ────────────────────────────
+
+interface UploadUrlResp {
+  upload_url?: string;
+  media_id?: string;
+  ret?: number;
+}
+
+async function getUploadUrl(
+  baseUrl: string,
+  token: string,
+  toUserId: string,
+  contextToken: string,
+  mediaType: number,
+  contentLength: number,
+): Promise<UploadUrlResp> {
+  const raw = await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/getuploadurl",
+    body: JSON.stringify({
+      to_user_id: toUserId,
+      context_token: contextToken,
+      media_type: mediaType,
+      content_length: contentLength,
+      base_info: { channel_version: CHANNEL_VERSION },
+    }),
+    token,
+    timeoutMs: 10_000,
+  });
+  return JSON.parse(raw) as UploadUrlResp;
+}
+
+async function uploadToCdn(
+  uploadUrl: string,
+  encryptedData: Buffer,
+): Promise<void> {
+  const res = await fetch(uploadUrl, {
+    method: "PUT",
+    body: encryptedData,
+    headers: { "Content-Length": String(encryptedData.length) },
+    signal: AbortSignal.timeout(60_000),
+  });
+  if (!res.ok) throw new Error(`CDN upload failed: ${res.status}`);
+}
+
+// ── Typing indicator ──────────────────────────────────────────────────────────
+
+interface GetConfigResp {
+  typing_ticket?: string;
+  ret?: number;
+}
+
+async function getTypingTicket(
+  baseUrl: string,
+  token: string,
+  toUserId: string,
+  contextToken: string,
+): Promise<string | null> {
+  try {
+    const raw = await apiFetch({
+      baseUrl,
+      endpoint: "ilink/bot/getconfig",
+      body: JSON.stringify({
+        to_user_id: toUserId,
+        context_token: contextToken,
+        base_info: { channel_version: CHANNEL_VERSION },
+      }),
+      token,
+      timeoutMs: 5_000,
+    });
+    const resp = JSON.parse(raw) as GetConfigResp;
+    return resp.typing_ticket ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function sendTyping(
+  baseUrl: string,
+  token: string,
+  toUserId: string,
+  contextToken: string,
+  typingTicket: string,
+): Promise<void> {
+  await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/sendtyping",
+    body: JSON.stringify({
+      to_user_id: toUserId,
+      typing_ticket: typingTicket,
+      context_token: contextToken,
+      base_info: { channel_version: CHANNEL_VERSION },
+    }),
+    token,
+    timeoutMs: 5_000,
+  });
+}
+
+/** Fire-and-forget: fetch typing_ticket then send typing indicator. */
+async function showTypingIndicator(
+  baseUrl: string,
+  token: string,
+  toUserId: string,
+  contextToken: string,
+): Promise<void> {
+  try {
+    const ticket = await getTypingTicket(baseUrl, token, toUserId, contextToken);
+    if (ticket) {
+      await sendTyping(baseUrl, token, toUserId, contextToken, ticket);
+    }
+  } catch {
+    // typing indicator is best-effort; never block message processing
   }
 }
 
@@ -188,13 +332,15 @@ async function pollQRStatus(
   }
 }
 
-async function doQRLogin(
-  baseUrl: string,
-): Promise<AccountData | null> {
+async function doQRLogin(baseUrl: string): Promise<AccountData | null> {
   log("正在获取微信登录二维码...");
   const qrResp = await fetchQRCode(baseUrl);
 
-  log("\n请使用微信扫描以下二维码：\n");
+  // Always log the raw URL before attempting terminal rendering.
+  // Block-drawing characters from qrcode-terminal can render as garbled bytes
+  // in Claude Code's interface, piped output, or non-UTF-8 environments.
+  log(`\n扫码链接（可复制到浏览器或用"从相册选取"扫描）:\n${qrResp.qrcode_img_content}\n`);
+  log("请使用微信扫描以下二维码：\n");
   try {
     const qrterm = await import("qrcode-terminal");
     await new Promise<void>((resolve) => {
@@ -208,7 +354,7 @@ async function doQRLogin(
       );
     });
   } catch {
-    log(`二维码链接: ${qrResp.qrcode_img_content}`);
+    // qrcode-terminal unavailable — URL above is sufficient
   }
 
   log("等待扫码...");
@@ -254,10 +400,51 @@ async function doQRLogin(
   return null;
 }
 
-// ── WeChat Message Types ─────────────────────────────────────────────────────
+// ── WeChat Message Types ──────────────────────────────────────────────────────
+
+const MSG_TYPE_USER = 1;
+const MSG_TYPE_BOT = 2;
+const MSG_STATE_FINISH = 2;
+
+const MSG_ITEM_TEXT = 1;
+const MSG_ITEM_IMAGE = 2;
+const MSG_ITEM_VOICE = 3;
+const MSG_ITEM_FILE = 4;
+const MSG_ITEM_VIDEO = 5;
 
 interface TextItem {
   text?: string;
+}
+
+interface ImageItem {
+  aes_key?: string;       // base64, AES-128-ECB key
+  cdn_url?: string;
+  width?: number;
+  height?: number;
+  media_id?: string;
+}
+
+interface VoiceItem {
+  text?: string;          // server-side speech-to-text transcript
+  aes_key?: string;
+  cdn_url?: string;
+  duration_ms?: number;
+}
+
+interface FileItem {
+  file_name?: string;
+  file_size?: number;
+  aes_key?: string;
+  cdn_url?: string;
+  media_id?: string;
+}
+
+interface VideoItem {
+  aes_key?: string;
+  cdn_url?: string;
+  duration_ms?: number;
+  thumb_cdn_url?: string;
+  media_id?: string;
 }
 
 interface RefMessage {
@@ -268,7 +455,10 @@ interface RefMessage {
 interface MessageItem {
   type?: number;
   text_item?: TextItem;
-  voice_item?: { text?: string };
+  image_item?: ImageItem;
+  voice_item?: VoiceItem;
+  file_item?: FileItem;
+  video_item?: VideoItem;
   ref_msg?: RefMessage;
 }
 
@@ -277,6 +467,7 @@ interface WeixinMessage {
   to_user_id?: string;
   client_id?: string;
   session_id?: string;
+  group_id?: string;       // present for group chat messages
   message_type?: number;
   message_state?: number;
   item_list?: MessageItem[];
@@ -293,45 +484,115 @@ interface GetUpdatesResp {
   longpolling_timeout_ms?: number;
 }
 
-// Message type constants
-const MSG_TYPE_USER = 1;
-const MSG_ITEM_TEXT = 1;
-const MSG_ITEM_VOICE = 3;
-const MSG_TYPE_BOT = 2;
-const MSG_STATE_FINISH = 2;
+// ── Message content extraction ────────────────────────────────────────────────
 
-function extractTextFromMessage(msg: WeixinMessage): string {
-  if (!msg.item_list?.length) return "";
+type ExtractedContent = {
+  text: string;
+  msgType: "text" | "voice" | "image" | "file" | "video" | "unknown";
+  mediaItem?: ImageItem | FileItem | VideoItem;
+};
+
+function extractContent(msg: WeixinMessage): ExtractedContent | null {
+  if (!msg.item_list?.length) return null;
+
   for (const item of msg.item_list) {
-    if (item.type === MSG_ITEM_TEXT && item.text_item?.text) {
-      const text = item.text_item.text;
-      const ref = item.ref_msg;
-      if (!ref) return text;
-      const parts: string[] = [];
-      if (ref.title) parts.push(ref.title);
-      if (!parts.length) return text;
-      return `[引用: ${parts.join(" | ")}]\n${text}`;
-    }
-    if (item.type === MSG_ITEM_VOICE && item.voice_item?.text) {
-      return item.voice_item.text;
+    switch (item.type) {
+      case MSG_ITEM_TEXT: {
+        if (!item.text_item?.text) continue;
+        let text = item.text_item.text;
+        if (item.ref_msg?.title) {
+          text = `[引用: ${item.ref_msg.title}]\n${text}`;
+        }
+        return { text, msgType: "text" };
+      }
+
+      case MSG_ITEM_VOICE: {
+        // Always prefer the server-provided transcript; fall back to placeholder
+        const transcript = item.voice_item?.text;
+        if (transcript) {
+          return { text: `[语音转文字] ${transcript}`, msgType: "voice" };
+        }
+        return { text: "[语音消息（无文字转录）]", msgType: "voice" };
+      }
+
+      case MSG_ITEM_IMAGE: {
+        const img = item.image_item;
+        const dims = img?.width && img?.height
+          ? ` (${img.width}×${img.height})`
+          : "";
+        return {
+          text: `[图片${dims}]`,
+          msgType: "image",
+          mediaItem: img,
+        };
+      }
+
+      case MSG_ITEM_FILE: {
+        const f = item.file_item;
+        const name = f?.file_name ? ` "${f.file_name}"` : "";
+        const size = f?.file_size
+          ? ` (${(f.file_size / 1024).toFixed(1)} KB)`
+          : "";
+        return {
+          text: `[文件${name}${size}]`,
+          msgType: "file",
+          mediaItem: f,
+        };
+      }
+
+      case MSG_ITEM_VIDEO: {
+        const v = item.video_item;
+        const dur = v?.duration_ms
+          ? ` (${(v.duration_ms / 1000).toFixed(1)}s)`
+          : "";
+        return {
+          text: `[视频${dur}]`,
+          msgType: "video",
+          mediaItem: v,
+        };
+      }
+
+      default:
+        return { text: `[未知消息类型 ${item.type}]`, msgType: "unknown" };
     }
   }
-  return "";
+  return null;
 }
 
-// ── Context Token Cache ──────────────────────────────────────────────────────
+// ── Context token cache (persisted to disk across session restarts) ───────────
+// Key: senderId (DM) or groupId (group chat)
 
-const contextTokenCache = new Map<string, string>();
+const CONTEXT_TOKEN_FILE = path.join(CREDENTIALS_DIR, "context_tokens.json");
 
-function cacheContextToken(userId: string, token: string): void {
-  contextTokenCache.set(userId, token);
+const contextTokenCache = new Map<string, string>(
+  (() => {
+    try {
+      const raw = fs.readFileSync(CONTEXT_TOKEN_FILE, "utf-8");
+      return Object.entries(JSON.parse(raw)) as [string, string][];
+    } catch {
+      return [];
+    }
+  })(),
+);
+
+function cacheContextToken(key: string, token: string): void {
+  contextTokenCache.set(key, token);
+  // Persist to disk so the token survives Claude Code session restarts
+  try {
+    fs.mkdirSync(CREDENTIALS_DIR, { recursive: true });
+    fs.writeFileSync(
+      CONTEXT_TOKEN_FILE,
+      JSON.stringify(Object.fromEntries(contextTokenCache), null, 2),
+      "utf-8",
+    );
+  } catch { /* best-effort */ }
 }
 
-function getCachedContextToken(userId: string): string | undefined {
-  return contextTokenCache.get(userId);
+function getCachedContextToken(key: string): string | undefined {
+  return contextTokenCache.get(key);
 }
 
-// ── getUpdates / sendMessage ─────────────────────────────────────────────────
+// ── getUpdates / sendMessage ──────────────────────────────────────────────────
 
 async function getUpdates(
   baseUrl: string,
@@ -368,8 +629,7 @@ async function sendTextMessage(
   to: string,
   text: string,
   contextToken: string,
-): Promise<string> {
-  const clientId = generateClientId();
+): Promise<void> {
   await apiFetch({
     baseUrl,
     endpoint: "ilink/bot/sendmessage",
@@ -377,7 +637,7 @@ async function sendTextMessage(
       msg: {
         from_user_id: "",
         to_user_id: to,
-        client_id: clientId,
+        client_id: generateClientId(),
         message_type: MSG_TYPE_BOT,
         message_state: MSG_STATE_FINISH,
         item_list: [{ type: MSG_ITEM_TEXT, text_item: { text } }],
@@ -388,10 +648,59 @@ async function sendTextMessage(
     token,
     timeoutMs: 15_000,
   });
-  return clientId;
 }
 
-// ── MCP Channel Server ──────────────────────────────────────────────────────
+async function sendImageMessage(
+  baseUrl: string,
+  token: string,
+  to: string,
+  imageBuffer: Buffer,
+  contextToken: string,
+): Promise<void> {
+  // Generate a random AES-128 key (16 bytes)
+  const aesKey = crypto.randomBytes(16);
+  const encrypted = encryptAesEcb(imageBuffer, aesKey);
+
+  // Get pre-signed CDN upload URL
+  const uploadResp = await getUploadUrl(
+    baseUrl, token, to, contextToken,
+    MSG_ITEM_IMAGE, encrypted.length,
+  );
+  if (!uploadResp.upload_url || !uploadResp.media_id) {
+    throw new Error(`getuploadurl failed: ${JSON.stringify(uploadResp)}`);
+  }
+
+  // Upload encrypted image to CDN
+  await uploadToCdn(uploadResp.upload_url, encrypted);
+
+  // Send message referencing the uploaded media
+  await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/sendmessage",
+    body: JSON.stringify({
+      msg: {
+        from_user_id: "",
+        to_user_id: to,
+        client_id: generateClientId(),
+        message_type: MSG_TYPE_BOT,
+        message_state: MSG_STATE_FINISH,
+        item_list: [{
+          type: MSG_ITEM_IMAGE,
+          image_item: {
+            media_id: uploadResp.media_id,
+            aes_key: aesKey.toString("base64"),
+          },
+        }],
+        context_token: contextToken,
+      },
+      base_info: { channel_version: CHANNEL_VERSION },
+    }),
+    token,
+    timeoutMs: 15_000,
+  });
+}
+
+// ── MCP Channel Server ────────────────────────────────────────────────────────
 
 const mcp = new Server(
   { name: CHANNEL_NAME, version: CHANNEL_VERSION },
@@ -401,36 +710,73 @@ const mcp = new Server(
       tools: {},
     },
     instructions: [
-      `Messages from WeChat users arrive as <channel source="wechat" sender="..." sender_id="...">`,
-      "Reply using the wechat_reply tool. You MUST pass the sender_id from the inbound tag.",
-      "Messages are from real WeChat users via the WeChat ClawBot interface.",
-      "Respond naturally in Chinese unless the user writes in another language.",
-      "Keep replies concise — WeChat is a chat app, not an essay platform.",
-      "Strip markdown formatting (WeChat doesn't render it). Use plain text.",
+      "Messages from WeChat users arrive as <channel source=\"wechat\" ...> tags.",
+      "",
+      "Tag attributes:",
+      "  sender       — display name (xxx part of xxx@im.wechat)",
+      "  sender_id    — full user ID (xxx@im.wechat) — REQUIRED for all reply tools",
+      "  msg_type     — text | voice | image | file | video | unknown",
+      "  can_reply    — 'true': reply normally; 'false': no session token, tell the user to send another message",
+      "  is_group     — 'true' if from a group chat",
+      "  group_id     — group ID when is_group=true (use this as the reply target in groups)",
+      "",
+      "Tools available:",
+      "  wechat_reply        — send a plain-text reply (always available)",
+      "  wechat_send_image   — send an image file from local disk (provide absolute path)",
+      "",
+      "Rules:",
+      "  - If can_reply=false, do NOT call wechat_reply. Instead output: 'NOTICE: cannot reply, session token missing. User must send one more message.'",
+      "  - Otherwise always use wechat_reply or wechat_send_image — never leave a message unanswered.",
+      "  - In group chats (is_group=true), pass the group_id as sender_id to reply to the group.",
+      "  - Strip all markdown — WeChat renders plain text only.",
+      "  - Keep replies concise. WeChat is a chat app.",
+      "  - Default language is Chinese unless the user writes in another language.",
+      "  - For voice messages the transcript is already in the content — treat it as text.",
+      "  - For image/file/video messages, describe what you see / acknowledge receipt.",
     ].join("\n"),
   },
 );
 
-// Tool: reply to WeChat
+// ── Tool handlers ─────────────────────────────────────────────────────────────
+
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "wechat_reply",
-      description: "Send a text reply back to the WeChat user",
+      description: "Send a plain-text reply to the WeChat user (or group)",
       inputSchema: {
         type: "object" as const,
         properties: {
           sender_id: {
             type: "string",
             description:
-              "The sender_id from the inbound <channel> tag (xxx@im.wechat format)",
+              "sender_id from the inbound tag (xxx@im.wechat). " +
+              "In group chats use group_id instead.",
           },
           text: {
             type: "string",
-            description: "The plain-text message to send (no markdown)",
+            description: "Plain-text message (no markdown, no emoji unless asked)",
           },
         },
         required: ["sender_id", "text"],
+      },
+    },
+    {
+      name: "wechat_send_image",
+      description: "Send a local image file to the WeChat user",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          sender_id: {
+            type: "string",
+            description: "Same as wechat_reply sender_id",
+          },
+          file_path: {
+            type: "string",
+            description: "Absolute path to the image file on disk (PNG, JPG, etc.)",
+          },
+        },
+        required: ["sender_id", "file_path"],
       },
     },
   ],
@@ -439,64 +785,75 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 let activeAccount: AccountData | null = null;
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+  if (!activeAccount) {
+    return { content: [{ type: "text" as const, text: "error: not logged in" }] };
+  }
+
   if (req.params.name === "wechat_reply") {
     const { sender_id, text } = req.params.arguments as {
       sender_id: string;
       text: string;
     };
-    if (!activeAccount) {
-      return {
-        content: [{ type: "text" as const, text: "error: not logged in" }],
-      };
-    }
     const contextToken = getCachedContextToken(sender_id);
     if (!contextToken) {
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: `error: no context_token for ${sender_id}. The user may need to send a message first.`,
-          },
-        ],
+        content: [{
+          type: "text" as const,
+          text: `error: no context_token for ${sender_id}. The user must send a message first.`,
+        }],
       };
     }
     try {
-      await sendTextMessage(
-        activeAccount.baseUrl,
-        activeAccount.token,
-        sender_id,
-        text,
-        contextToken,
-      );
+      await sendTextMessage(activeAccount.baseUrl, activeAccount.token, sender_id, text, contextToken);
       return { content: [{ type: "text" as const, text: "sent" }] };
     } catch (err) {
-      return {
-        content: [
-          { type: "text" as const, text: `send failed: ${String(err)}` },
-        ],
-      };
+      return { content: [{ type: "text" as const, text: `send failed: ${String(err)}` }] };
     }
   }
+
+  if (req.params.name === "wechat_send_image") {
+    const { sender_id, file_path } = req.params.arguments as {
+      sender_id: string;
+      file_path: string;
+    };
+    const contextToken = getCachedContextToken(sender_id);
+    if (!contextToken) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: `error: no context_token for ${sender_id}.`,
+        }],
+      };
+    }
+    try {
+      const imageBuffer = fs.readFileSync(file_path);
+      await sendImageMessage(
+        activeAccount.baseUrl, activeAccount.token,
+        sender_id, imageBuffer, contextToken,
+      );
+      return { content: [{ type: "text" as const, text: "image sent" }] };
+    } catch (err) {
+      return { content: [{ type: "text" as const, text: `image send failed: ${String(err)}` }] };
+    }
+  }
+
   throw new Error(`unknown tool: ${req.params.name}`);
 });
 
-// ── Long-poll loop ──────────────────────────────────────────────────────────
+// ── Long-poll loop ────────────────────────────────────────────────────────────
 
 async function startPolling(account: AccountData): Promise<never> {
   const { baseUrl, token } = account;
   let getUpdatesBuf = "";
   let consecutiveFailures = 0;
 
-  // Load cached sync buf if available
   const syncBufFile = path.join(CREDENTIALS_DIR, "sync_buf.txt");
   try {
     if (fs.existsSync(syncBufFile)) {
       getUpdatesBuf = fs.readFileSync(syncBufFile, "utf-8");
       log(`恢复上次同步状态 (${getUpdatesBuf.length} bytes)`);
     }
-  } catch {
-    // ignore
-  }
+  } catch { /* ignore */ }
 
   log("开始监听微信消息...");
 
@@ -504,19 +861,14 @@ async function startPolling(account: AccountData): Promise<never> {
     try {
       const resp = await getUpdates(baseUrl, token, getUpdatesBuf);
 
-      // Handle API errors
       const isError =
         (resp.ret !== undefined && resp.ret !== 0) ||
         (resp.errcode !== undefined && resp.errcode !== 0);
       if (isError) {
         consecutiveFailures++;
-        logError(
-          `getUpdates 失败: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ""}`,
-        );
+        logError(`getUpdates 失败: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ""}`);
         if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-          logError(
-            `连续失败 ${MAX_CONSECUTIVE_FAILURES} 次，等待 ${BACKOFF_DELAY_MS / 1000}s`,
-          );
+          logError(`连续失败 ${MAX_CONSECUTIVE_FAILURES} 次，等待 ${BACKOFF_DELAY_MS / 1000}s`);
           consecutiveFailures = 0;
           await new Promise((r) => setTimeout(r, BACKOFF_DELAY_MS));
         } else {
@@ -527,43 +879,58 @@ async function startPolling(account: AccountData): Promise<never> {
 
       consecutiveFailures = 0;
 
-      // Save sync buf
       if (resp.get_updates_buf) {
         getUpdatesBuf = resp.get_updates_buf;
-        try {
-          fs.writeFileSync(syncBufFile, getUpdatesBuf, "utf-8");
-        } catch {
-          // ignore
-        }
+        try { fs.writeFileSync(syncBufFile, getUpdatesBuf, "utf-8"); } catch { /* ignore */ }
       }
 
-      // Process messages
       for (const msg of resp.msgs ?? []) {
-        // Only process user messages (not bot messages)
         if (msg.message_type !== MSG_TYPE_USER) continue;
 
-        const text = extractTextFromMessage(msg);
-        if (!text) continue;
+        const extracted = extractContent(msg);
+        if (!extracted) continue;
 
         const senderId = msg.from_user_id ?? "unknown";
+        const groupId = msg.group_id;
+        const isGroup = Boolean(groupId);
 
-        // Cache context token for reply
+        // Cache context token: group messages key by group_id, DMs by sender_id
+        const contextKey = groupId ?? senderId;
         if (msg.context_token) {
-          cacheContextToken(senderId, msg.context_token);
+          cacheContextToken(contextKey, msg.context_token);
+          // In group chats also cache by sender_id so Claude can refer back
+          if (isGroup) cacheContextToken(senderId, msg.context_token);
+        } else {
+          logError(`消息缺少 context_token: from=${senderId} — 无法回复，等待下一条消息`);
         }
 
-        log(`收到消息: from=${senderId} text=${text.slice(0, 50)}...`);
+        // Determine whether we can reply (need a context_token, either fresh or cached)
+        const canReply = Boolean(getCachedContextToken(contextKey));
 
-        // Push to Claude Code session
+        const senderShort = senderId.split("@")[0] || senderId;
+        log(`收到${isGroup ? "群" : "私"}消息 [${extracted.msgType}]: from=${senderShort}${isGroup ? ` group=${groupId}` : ""} can_reply=${canReply} "${extracted.text.slice(0, 60)}"`);
+
+        // Show typing indicator only when we can actually reply
+        if (canReply && msg.context_token) {
+          showTypingIndicator(baseUrl, token, senderId, msg.context_token).catch(() => {});
+        }
+
+        // Build meta for the <channel> tag
+        const meta: Record<string, string> = {
+          sender: senderShort,
+          sender_id: isGroup ? (groupId as string) : senderId,
+          msg_type: extracted.msgType,
+          can_reply: String(canReply),
+        };
+        if (isGroup) {
+          meta.is_group = "true";
+          meta.group_id = groupId as string;
+          meta.from_sender_id = senderId;
+        }
+
         await mcp.notification({
           method: "notifications/claude/channel",
-          params: {
-            content: text,
-            meta: {
-              sender: senderId.split("@")[0] || senderId,
-              sender_id: senderId,
-            },
-          },
+          params: { content: extracted.text, meta },
         });
       }
     } catch (err) {
@@ -579,14 +946,12 @@ async function startPolling(account: AccountData): Promise<never> {
   }
 }
 
-// ── Main ────────────────────────────────────────────────────────────────────
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
-  // Connect MCP transport first (Claude Code expects stdio handshake)
   await mcp.connect(new StdioServerTransport());
   log("MCP 连接就绪");
 
-  // Check for saved credentials
   let account = loadCredentials();
 
   if (!account) {
@@ -601,8 +966,6 @@ async function main() {
   }
 
   activeAccount = account;
-
-  // Start long-poll (runs forever)
   await startPolling(account);
 }
 
