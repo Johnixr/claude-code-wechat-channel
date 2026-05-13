@@ -1,28 +1,47 @@
 #!/usr/bin/env bun
+// @bun
 var __create = Object.create;
 var __getProtoOf = Object.getPrototypeOf;
 var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
+function __accessProp(key) {
+  return this[key];
+}
+var __toESMCache_node;
+var __toESMCache_esm;
 var __toESM = (mod, isNodeMode, target) => {
+  var canCache = mod != null && typeof mod === "object";
+  if (canCache) {
+    var cache = isNodeMode ? __toESMCache_node ??= new WeakMap : __toESMCache_esm ??= new WeakMap;
+    var cached = cache.get(mod);
+    if (cached)
+      return cached;
+  }
   target = mod != null ? __create(__getProtoOf(mod)) : {};
   const to = isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target;
   for (let key of __getOwnPropNames(mod))
     if (!__hasOwnProp.call(to, key))
       __defProp(to, key, {
-        get: () => mod[key],
+        get: __accessProp.bind(mod, key),
         enumerable: true
       });
+  if (canCache)
+    cache.set(mod, to);
   return to;
 };
 var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
+var __returnValue = (v) => v;
+function __exportSetter(name, newValue) {
+  this[name] = __returnValue.bind(null, newValue);
+}
 var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, {
       get: all[name],
       enumerable: true,
       configurable: true,
-      set: (newValue) => all[name] = () => newValue
+      set: __exportSetter.bind(all, name)
     });
 };
 
@@ -6285,7 +6304,7 @@ var require_formats = __commonJS((exports) => {
   }
   var TIME = /^(\d\d):(\d\d):(\d\d(?:\.\d+)?)(z|([+-])(\d\d)(?::?(\d\d))?)?$/i;
   function getTime(strictTimeZone) {
-    return function time(str) {
+    return function time3(str) {
       const matches = TIME.exec(str);
       if (!matches)
         return false;
@@ -11150,7 +11169,7 @@ function finalize(ctx, schema) {
     result.$schema = "http://json-schema.org/draft-07/schema#";
   } else if (ctx.target === "draft-04") {
     result.$schema = "http://json-schema.org/draft-04/schema#";
-  } else if (ctx.target === "openapi-3.0") {} else {}
+  } else if (ctx.target === "openapi-3.0") {}
   if (ctx.external?.uri) {
     const id = ctx.external.registry.get(schema)?.id;
     if (!id)
@@ -11372,7 +11391,7 @@ var literalProcessor = (schema, ctx, json, _params) => {
     if (val === undefined) {
       if (ctx.unrepresentable === "throw") {
         throw new Error("Literal `undefined` cannot be represented in JSON Schema");
-      } else {}
+      }
     } else if (typeof val === "bigint") {
       if (ctx.unrepresentable === "throw") {
         throw new Error("BigInt literals cannot be represented in JSON Schema");
@@ -15457,7 +15476,7 @@ var ServerResultSchema2 = union([
 
 // wechat-channel.ts
 var CHANNEL_NAME = "wechat";
-var CHANNEL_VERSION = "0.1.0";
+var CHANNEL_VERSION = "0.2.0";
 var DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 var BOT_TYPE = "3";
 var CREDENTIALS_DIR = path.join(process.env.HOME || "~", ".claude", "channels", "wechat");
@@ -15531,6 +15550,137 @@ async function apiFetch(params) {
     throw err;
   }
 }
+function parseAesKey(raw) {
+  const decoded = Buffer.from(raw, "base64");
+  if (decoded.length === 16)
+    return decoded;
+  const hex = decoded.toString("utf-8");
+  if (/^[0-9a-f]{32}$/i.test(hex))
+    return Buffer.from(hex, "hex");
+  throw new Error(`Cannot parse AES key: decoded ${decoded.length} bytes, not 16 and not 32-char hex`);
+}
+function decryptAesEcb(data, keyBase64) {
+  const key = parseAesKey(keyBase64);
+  const decipher = crypto.createDecipheriv("aes-128-ecb", key, null);
+  decipher.setAutoPadding(true);
+  return Buffer.concat([decipher.update(data), decipher.final()]);
+}
+function encryptAesEcb(data, key) {
+  const cipher = crypto.createCipheriv("aes-128-ecb", key, null);
+  cipher.setAutoPadding(true);
+  return Buffer.concat([cipher.update(data), cipher.final()]);
+}
+async function downloadAndDecryptMedia(cdnUrl, aesKeyBase64) {
+  const res = await fetch(cdnUrl, { signal: AbortSignal.timeout(30000) });
+  if (!res.ok)
+    throw new Error(`CDN download failed: ${res.status}`);
+  const encrypted = Buffer.from(await res.arrayBuffer());
+  return decryptAesEcb(encrypted, aesKeyBase64);
+}
+var IMAGES_DIR = path.join(CREDENTIALS_DIR, "images");
+function getInboundImageUrl(item) {
+  return item.cdn_url || item.media?.full_url;
+}
+function getInboundAesKey(item) {
+  if (item.media?.aes_key)
+    return item.media.aes_key;
+  const hex = item.aeskey;
+  if (hex && /^[0-9a-f]{32}$/i.test(hex)) {
+    return Buffer.from(hex, "hex").toString("base64");
+  }
+  if (item.aes_key)
+    return item.aes_key;
+  return null;
+}
+async function downloadAndSaveImage(item, senderId) {
+  const url = getInboundImageUrl(item);
+  const aesKey = getInboundAesKey(item);
+  if (!url || !aesKey) {
+    logError(`\u56FE\u7247\u7F3A\u5C11 URL \u6216 AES key: url=${url} key=${aesKey ? "yes" : "no"}`);
+    return null;
+  }
+  try {
+    fs.mkdirSync(IMAGES_DIR, { recursive: true });
+    const decrypted = await downloadAndDecryptMedia(url, aesKey);
+    const magic = decrypted.subarray(0, 4);
+    const ext = magic[0] === 137 && magic[1] === 80 ? ".png" : magic[0] === 71 && magic[1] === 73 ? ".gif" : magic[0] === 82 && magic[1] === 73 ? ".webp" : ".jpg";
+    const filename = `${senderId.split("@")[0]}_${Date.now()}${ext}`;
+    const filepath = path.join(IMAGES_DIR, filename);
+    fs.writeFileSync(filepath, decrypted);
+    log(`\u56FE\u7247\u5DF2\u4FDD\u5B58: ${filepath} (${decrypted.length} bytes)`);
+    return filepath;
+  } catch (err) {
+    logError(`\u56FE\u7247\u4E0B\u8F7D/\u89E3\u5BC6\u5931\u8D25: ${String(err)}`);
+    return null;
+  }
+}
+async function getUploadUrl(baseUrl, token, toUserId, contextToken, mediaType, contentLength) {
+  const raw = await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/getuploadurl",
+    body: JSON.stringify({
+      to_user_id: toUserId,
+      context_token: contextToken,
+      media_type: mediaType,
+      content_length: contentLength,
+      base_info: { channel_version: CHANNEL_VERSION }
+    }),
+    token,
+    timeoutMs: 1e4
+  });
+  return JSON.parse(raw);
+}
+async function uploadToCdn(uploadUrl, encryptedData) {
+  const res = await fetch(uploadUrl, {
+    method: "PUT",
+    body: encryptedData,
+    headers: { "Content-Length": String(encryptedData.length) },
+    signal: AbortSignal.timeout(60000)
+  });
+  if (!res.ok)
+    throw new Error(`CDN upload failed: ${res.status}`);
+}
+async function getTypingTicket(baseUrl, token, toUserId, contextToken) {
+  try {
+    const raw = await apiFetch({
+      baseUrl,
+      endpoint: "ilink/bot/getconfig",
+      body: JSON.stringify({
+        to_user_id: toUserId,
+        context_token: contextToken,
+        base_info: { channel_version: CHANNEL_VERSION }
+      }),
+      token,
+      timeoutMs: 5000
+    });
+    const resp = JSON.parse(raw);
+    return resp.typing_ticket ?? null;
+  } catch {
+    return null;
+  }
+}
+async function sendTyping(baseUrl, token, toUserId, contextToken, typingTicket) {
+  await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/sendtyping",
+    body: JSON.stringify({
+      to_user_id: toUserId,
+      typing_ticket: typingTicket,
+      context_token: contextToken,
+      base_info: { channel_version: CHANNEL_VERSION }
+    }),
+    token,
+    timeoutMs: 5000
+  });
+}
+async function showTypingIndicator(baseUrl, token, toUserId, contextToken) {
+  try {
+    const ticket = await getTypingTicket(baseUrl, token, toUserId, contextToken);
+    if (ticket) {
+      await sendTyping(baseUrl, token, toUserId, contextToken, ticket);
+    }
+  } catch {}
+}
 async function fetchQRCode(baseUrl) {
   const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
   const url = new URL(`ilink/bot/get_bot_qrcode?bot_type=${encodeURIComponent(BOT_TYPE)}`, base);
@@ -15565,7 +15715,10 @@ async function doQRLogin(baseUrl) {
   log("\u6B63\u5728\u83B7\u53D6\u5FAE\u4FE1\u767B\u5F55\u4E8C\u7EF4\u7801...");
   const qrResp = await fetchQRCode(baseUrl);
   log(`
-\u8BF7\u4F7F\u7528\u5FAE\u4FE1\u626B\u63CF\u4EE5\u4E0B\u4E8C\u7EF4\u7801\uFF1A
+\u626B\u7801\u94FE\u63A5\uFF08\u53EF\u590D\u5236\u5230\u6D4F\u89C8\u5668\u6216\u7528"\u4ECE\u76F8\u518C\u9009\u53D6"\u626B\u63CF\uFF09:
+${qrResp.qrcode_img_content}
+`);
+  log(`\u8BF7\u4F7F\u7528\u5FAE\u4FE1\u626B\u63CF\u4EE5\u4E0B\u4E8C\u7EF4\u7801\uFF1A
 `);
   try {
     const qrterm = await Promise.resolve().then(() => __toESM(require_main(), 1));
@@ -15576,9 +15729,7 @@ async function doQRLogin(baseUrl) {
         resolve();
       });
     });
-  } catch {
-    log(`\u4E8C\u7EF4\u7801\u94FE\u63A5: ${qrResp.qrcode_img_content}`);
-  }
+  } catch {}
   log("\u7B49\u5F85\u626B\u7801...");
   const deadline = Date.now() + 480000;
   let scannedPrinted = false;
@@ -15619,39 +15770,87 @@ async function doQRLogin(baseUrl) {
   return null;
 }
 var MSG_TYPE_USER = 1;
-var MSG_ITEM_TEXT = 1;
-var MSG_ITEM_VOICE = 3;
 var MSG_TYPE_BOT = 2;
 var MSG_STATE_FINISH = 2;
-function extractTextFromMessage(msg) {
+var MSG_ITEM_TEXT = 1;
+var MSG_ITEM_IMAGE = 2;
+var MSG_ITEM_VOICE = 3;
+var MSG_ITEM_FILE = 4;
+var MSG_ITEM_VIDEO = 5;
+function extractContent(msg) {
   if (!msg.item_list?.length)
-    return "";
+    return null;
   for (const item of msg.item_list) {
-    if (item.type === MSG_ITEM_TEXT && item.text_item?.text) {
-      const text = item.text_item.text;
-      const ref = item.ref_msg;
-      if (!ref)
-        return text;
-      const parts = [];
-      if (ref.title)
-        parts.push(ref.title);
-      if (!parts.length)
-        return text;
-      return `[\u5F15\u7528: ${parts.join(" | ")}]
+    switch (item.type) {
+      case MSG_ITEM_TEXT: {
+        if (!item.text_item?.text)
+          continue;
+        let text = item.text_item.text;
+        if (item.ref_msg?.title) {
+          text = `[\u5F15\u7528: ${item.ref_msg.title}]
 ${text}`;
-    }
-    if (item.type === MSG_ITEM_VOICE && item.voice_item?.text) {
-      return item.voice_item.text;
+        }
+        return { text, msgType: "text" };
+      }
+      case MSG_ITEM_VOICE: {
+        const transcript = item.voice_item?.text;
+        if (transcript) {
+          return { text: `[\u8BED\u97F3\u8F6C\u6587\u5B57] ${transcript}`, msgType: "voice" };
+        }
+        return { text: "[\u8BED\u97F3\u6D88\u606F\uFF08\u65E0\u6587\u5B57\u8F6C\u5F55\uFF09]", msgType: "voice" };
+      }
+      case MSG_ITEM_IMAGE: {
+        const img = item.image_item;
+        const dims = img?.width && img?.height ? ` (${img.width}\xD7${img.height})` : "";
+        return {
+          text: `[\u56FE\u7247${dims}]`,
+          msgType: "image",
+          mediaItem: img
+        };
+      }
+      case MSG_ITEM_FILE: {
+        const f = item.file_item;
+        const name = f?.file_name ? ` "${f.file_name}"` : "";
+        const size = f?.file_size ? ` (${(f.file_size / 1024).toFixed(1)} KB)` : "";
+        return {
+          text: `[\u6587\u4EF6${name}${size}]`,
+          msgType: "file",
+          mediaItem: f
+        };
+      }
+      case MSG_ITEM_VIDEO: {
+        const v = item.video_item;
+        const dur = v?.duration_ms ? ` (${(v.duration_ms / 1000).toFixed(1)}s)` : "";
+        return {
+          text: `[\u89C6\u9891${dur}]`,
+          msgType: "video",
+          mediaItem: v
+        };
+      }
+      default:
+        return { text: `[\u672A\u77E5\u6D88\u606F\u7C7B\u578B ${item.type}]`, msgType: "unknown" };
     }
   }
-  return "";
+  return null;
 }
-var contextTokenCache = new Map;
-function cacheContextToken(userId, token) {
-  contextTokenCache.set(userId, token);
+var CONTEXT_TOKEN_FILE = path.join(CREDENTIALS_DIR, "context_tokens.json");
+var contextTokenCache = new Map((() => {
+  try {
+    const raw = fs.readFileSync(CONTEXT_TOKEN_FILE, "utf-8");
+    return Object.entries(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+})());
+function cacheContextToken(key, token) {
+  contextTokenCache.set(key, token);
+  try {
+    fs.mkdirSync(CREDENTIALS_DIR, { recursive: true });
+    fs.writeFileSync(CONTEXT_TOKEN_FILE, JSON.stringify(Object.fromEntries(contextTokenCache), null, 2), "utf-8");
+  } catch {}
 }
-function getCachedContextToken(userId) {
-  return contextTokenCache.get(userId);
+function getCachedContextToken(key) {
+  return contextTokenCache.get(key);
 }
 async function getUpdates(baseUrl, token, getUpdatesBuf) {
   try {
@@ -15677,7 +15876,6 @@ function generateClientId() {
   return `claude-code-wechat:${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
 }
 async function sendTextMessage(baseUrl, token, to, text, contextToken) {
-  const clientId = generateClientId();
   await apiFetch({
     baseUrl,
     endpoint: "ilink/bot/sendmessage",
@@ -15685,7 +15883,7 @@ async function sendTextMessage(baseUrl, token, to, text, contextToken) {
       msg: {
         from_user_id: "",
         to_user_id: to,
-        client_id: clientId,
+        client_id: generateClientId(),
         message_type: MSG_TYPE_BOT,
         message_state: MSG_STATE_FINISH,
         item_list: [{ type: MSG_ITEM_TEXT, text_item: { text } }],
@@ -15696,7 +15894,39 @@ async function sendTextMessage(baseUrl, token, to, text, contextToken) {
     token,
     timeoutMs: 15000
   });
-  return clientId;
+}
+async function sendImageMessage(baseUrl, token, to, imageBuffer, contextToken) {
+  const aesKey = crypto.randomBytes(16);
+  const encrypted = encryptAesEcb(imageBuffer, aesKey);
+  const uploadResp = await getUploadUrl(baseUrl, token, to, contextToken, MSG_ITEM_IMAGE, encrypted.length);
+  if (!uploadResp.upload_url || !uploadResp.media_id) {
+    throw new Error(`getuploadurl failed: ${JSON.stringify(uploadResp)}`);
+  }
+  await uploadToCdn(uploadResp.upload_url, encrypted);
+  await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/sendmessage",
+    body: JSON.stringify({
+      msg: {
+        from_user_id: "",
+        to_user_id: to,
+        client_id: generateClientId(),
+        message_type: MSG_TYPE_BOT,
+        message_state: MSG_STATE_FINISH,
+        item_list: [{
+          type: MSG_ITEM_IMAGE,
+          image_item: {
+            media_id: uploadResp.media_id,
+            aes_key: aesKey.toString("base64")
+          }
+        }],
+        context_token: contextToken
+      },
+      base_info: { channel_version: CHANNEL_VERSION }
+    }),
+    token,
+    timeoutMs: 15000
+  });
 }
 var mcp = new Server({ name: CHANNEL_NAME, version: CHANNEL_VERSION }, {
   capabilities: {
@@ -15704,12 +15934,29 @@ var mcp = new Server({ name: CHANNEL_NAME, version: CHANNEL_VERSION }, {
     tools: {}
   },
   instructions: [
-    `Messages from WeChat users arrive as <channel source="wechat" sender="..." sender_id="...">`,
-    "Reply using the wechat_reply tool. You MUST pass the sender_id from the inbound tag.",
-    "Messages are from real WeChat users via the WeChat ClawBot interface.",
-    "Respond naturally in Chinese unless the user writes in another language.",
-    "Keep replies concise \u2014 WeChat is a chat app, not an essay platform.",
-    "Strip markdown formatting (WeChat doesn't render it). Use plain text."
+    'Messages from WeChat users arrive as <channel source="wechat" ...> tags.',
+    "",
+    "Tag attributes:",
+    "  sender       \u2014 display name (xxx part of xxx@im.wechat)",
+    "  sender_id    \u2014 full user ID (xxx@im.wechat) \u2014 REQUIRED for all reply tools",
+    "  msg_type     \u2014 text | voice | image | file | video | unknown",
+    "  can_reply    \u2014 'true': reply normally; 'false': no session token, tell the user to send another message",
+    "  is_group     \u2014 'true' if from a group chat",
+    "  group_id     \u2014 group ID when is_group=true (use this as the reply target in groups)",
+    "",
+    "Tools available:",
+    "  wechat_reply        \u2014 send a plain-text reply (always available)",
+    "  wechat_send_image   \u2014 send an image file from local disk (provide absolute path)",
+    "",
+    "Rules:",
+    "  - If can_reply=false, do NOT call wechat_reply. Instead output: 'NOTICE: cannot reply, session token missing. User must send one more message.'",
+    "  - Otherwise always use wechat_reply or wechat_send_image \u2014 never leave a message unanswered.",
+    "  - In group chats (is_group=true), pass the group_id as sender_id to reply to the group.",
+    "  - Strip all markdown \u2014 WeChat renders plain text only.",
+    "  - Keep replies concise. WeChat is a chat app.",
+    "  - Default language is Chinese unless the user writes in another language.",
+    "  - For voice messages the transcript is already in the content \u2014 treat it as text.",
+    "  - For image/file/video messages, describe what you see / acknowledge receipt."
   ].join(`
 `)
 });
@@ -15717,53 +15964,82 @@ mcp.setRequestHandler(ListToolsRequestSchema2, async () => ({
   tools: [
     {
       name: "wechat_reply",
-      description: "Send a text reply back to the WeChat user",
+      description: "Send a plain-text reply to the WeChat user (or group)",
       inputSchema: {
         type: "object",
         properties: {
           sender_id: {
             type: "string",
-            description: "The sender_id from the inbound <channel> tag (xxx@im.wechat format)"
+            description: "sender_id from the inbound tag (xxx@im.wechat). In group chats use group_id instead."
           },
           text: {
             type: "string",
-            description: "The plain-text message to send (no markdown)"
+            description: "Plain-text message (no markdown, no emoji unless asked)"
           }
         },
         required: ["sender_id", "text"]
+      }
+    },
+    {
+      name: "wechat_send_image",
+      description: "Send a local image file to the WeChat user",
+      inputSchema: {
+        type: "object",
+        properties: {
+          sender_id: {
+            type: "string",
+            description: "Same as wechat_reply sender_id"
+          },
+          file_path: {
+            type: "string",
+            description: "Absolute path to the image file on disk (PNG, JPG, etc.)"
+          }
+        },
+        required: ["sender_id", "file_path"]
       }
     }
   ]
 }));
 var activeAccount = null;
 mcp.setRequestHandler(CallToolRequestSchema2, async (req) => {
+  if (!activeAccount) {
+    return { content: [{ type: "text", text: "error: not logged in" }] };
+  }
   if (req.params.name === "wechat_reply") {
     const { sender_id, text } = req.params.arguments;
-    if (!activeAccount) {
-      return {
-        content: [{ type: "text", text: "error: not logged in" }]
-      };
-    }
     const contextToken = getCachedContextToken(sender_id);
     if (!contextToken) {
       return {
-        content: [
-          {
-            type: "text",
-            text: `error: no context_token for ${sender_id}. The user may need to send a message first.`
-          }
-        ]
+        content: [{
+          type: "text",
+          text: `error: no context_token for ${sender_id}. The user must send a message first.`
+        }]
       };
     }
     try {
       await sendTextMessage(activeAccount.baseUrl, activeAccount.token, sender_id, text, contextToken);
       return { content: [{ type: "text", text: "sent" }] };
     } catch (err) {
+      return { content: [{ type: "text", text: `send failed: ${String(err)}` }] };
+    }
+  }
+  if (req.params.name === "wechat_send_image") {
+    const { sender_id, file_path } = req.params.arguments;
+    const contextToken = getCachedContextToken(sender_id);
+    if (!contextToken) {
       return {
-        content: [
-          { type: "text", text: `send failed: ${String(err)}` }
-        ]
+        content: [{
+          type: "text",
+          text: `error: no context_token for ${sender_id}.`
+        }]
       };
+    }
+    try {
+      const imageBuffer = fs.readFileSync(file_path);
+      await sendImageMessage(activeAccount.baseUrl, activeAccount.token, sender_id, imageBuffer, contextToken);
+      return { content: [{ type: "text", text: "image sent" }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `image send failed: ${String(err)}` }] };
     }
   }
   throw new Error(`unknown tool: ${req.params.name}`);
@@ -15806,23 +16082,47 @@ async function startPolling(account) {
       for (const msg of resp.msgs ?? []) {
         if (msg.message_type !== MSG_TYPE_USER)
           continue;
-        const text = extractTextFromMessage(msg);
-        if (!text)
+        const extracted = extractContent(msg);
+        if (!extracted)
           continue;
         const senderId = msg.from_user_id ?? "unknown";
+        const groupId = msg.group_id;
+        const isGroup = Boolean(groupId);
+        const contextKey = groupId ?? senderId;
         if (msg.context_token) {
-          cacheContextToken(senderId, msg.context_token);
+          cacheContextToken(contextKey, msg.context_token);
+          if (isGroup)
+            cacheContextToken(senderId, msg.context_token);
+        } else {
+          logError(`\u6D88\u606F\u7F3A\u5C11 context_token: from=${senderId} \u2014 \u65E0\u6CD5\u56DE\u590D\uFF0C\u7B49\u5F85\u4E0B\u4E00\u6761\u6D88\u606F`);
         }
-        log(`\u6536\u5230\u6D88\u606F: from=${senderId} text=${text.slice(0, 50)}...`);
+        const canReply = Boolean(getCachedContextToken(contextKey));
+        const senderShort = senderId.split("@")[0] || senderId;
+        log(`\u6536\u5230${isGroup ? "\u7FA4" : "\u79C1"}\u6D88\u606F [${extracted.msgType}]: from=${senderShort}${isGroup ? ` group=${groupId}` : ""} can_reply=${canReply} "${extracted.text.slice(0, 60)}"`);
+        if (canReply && msg.context_token) {
+          showTypingIndicator(baseUrl, token, senderId, msg.context_token).catch(() => {});
+        }
+        let content = extracted.text;
+        if (extracted.msgType === "image" && extracted.mediaItem) {
+          const savedPath = await downloadAndSaveImage(extracted.mediaItem, senderId);
+          if (savedPath) {
+            content = `[\u56FE\u7247: ${savedPath}]`;
+          }
+        }
+        const meta2 = {
+          sender: senderShort,
+          sender_id: isGroup ? groupId : senderId,
+          msg_type: extracted.msgType,
+          can_reply: String(canReply)
+        };
+        if (isGroup) {
+          meta2.is_group = "true";
+          meta2.group_id = groupId;
+          meta2.from_sender_id = senderId;
+        }
         await mcp.notification({
           method: "notifications/claude/channel",
-          params: {
-            content: text,
-            meta: {
-              sender: senderId.split("@")[0] || senderId,
-              sender_id: senderId
-            }
-          }
+          params: { content, meta: meta2 }
         });
       }
     } catch (err) {
