@@ -138,8 +138,16 @@ async function apiFetch(params: {
 
 // ── AES-128-ECB crypto (for CDN media) ───────────────────────────────────────
 
+function parseAesKey(raw: string): Buffer {
+  const decoded = Buffer.from(raw, "base64");
+  if (decoded.length === 16) return decoded;
+  const hex = decoded.toString("utf-8");
+  if (/^[0-9a-f]{32}$/i.test(hex)) return Buffer.from(hex, "hex");
+  throw new Error(`Cannot parse AES key: decoded ${decoded.length} bytes, not 16 and not 32-char hex`);
+}
+
 function decryptAesEcb(data: Buffer, keyBase64: string): Buffer {
-  const key = Buffer.from(keyBase64, "base64");
+  const key = parseAesKey(keyBase64);
   const decipher = crypto.createDecipheriv("aes-128-ecb", key, null);
   decipher.setAutoPadding(true);
   return Buffer.concat([decipher.update(data), decipher.final()]);
@@ -161,6 +169,51 @@ async function downloadAndDecryptMedia(
   if (!res.ok) throw new Error(`CDN download failed: ${res.status}`);
   const encrypted = Buffer.from(await res.arrayBuffer());
   return decryptAesEcb(encrypted, aesKeyBase64);
+}
+
+const IMAGES_DIR = path.join(CREDENTIALS_DIR, "images");
+
+function getInboundImageUrl(item: ImageItem): string | undefined {
+  return item.cdn_url || item.media?.full_url;
+}
+
+function getInboundAesKey(item: ImageItem): string | null {
+  if (item.media?.aes_key) return item.media.aes_key;
+  const hex = item.aeskey;
+  if (hex && /^[0-9a-f]{32}$/i.test(hex)) {
+    return Buffer.from(hex, "hex").toString("base64");
+  }
+  if (item.aes_key) return item.aes_key;
+  return null;
+}
+
+async function downloadAndSaveImage(
+  item: ImageItem,
+  senderId: string,
+): Promise<string | null> {
+  const url = getInboundImageUrl(item);
+  const aesKey = getInboundAesKey(item);
+  if (!url || !aesKey) {
+    logError(`图片缺少 URL 或 AES key: url=${url} key=${aesKey ? "yes" : "no"}`);
+    return null;
+  }
+  try {
+    fs.mkdirSync(IMAGES_DIR, { recursive: true });
+    const decrypted = await downloadAndDecryptMedia(url, aesKey);
+    const magic = decrypted.subarray(0, 4);
+    const ext = (magic[0] === 0x89 && magic[1] === 0x50) ? ".png"
+      : (magic[0] === 0x47 && magic[1] === 0x49) ? ".gif"
+      : (magic[0] === 0x52 && magic[1] === 0x49) ? ".webp"
+      : ".jpg";
+    const filename = `${senderId.split("@")[0]}_${Date.now()}${ext}`;
+    const filepath = path.join(IMAGES_DIR, filename);
+    fs.writeFileSync(filepath, decrypted);
+    log(`图片已保存: ${filepath} (${decrypted.length} bytes)`);
+    return filepath;
+  } catch (err) {
+    logError(`图片下载/解密失败: ${String(err)}`);
+    return null;
+  }
 }
 
 // ── CDN media upload (for sending images / files) ────────────────────────────
@@ -416,9 +469,21 @@ interface TextItem {
   text?: string;
 }
 
+interface CDNMedia {
+  aes_key?: string;
+  full_url?: string;
+  mid_size?: number;
+  thumb_size?: number;
+  thumb_height?: number;
+  thumb_width?: number;
+  hd_size?: number;
+}
+
 interface ImageItem {
-  aes_key?: string;       // base64, AES-128-ECB key
+  aes_key?: string;       // base64, AES-128-ECB key (used for sending)
+  aeskey?: string;        // 32-char hex key (present on inbound CDN images)
   cdn_url?: string;
+  media?: CDNMedia;       // inbound CDN media with full_url + aes_key
   width?: number;
   height?: number;
   media_id?: string;
@@ -915,6 +980,17 @@ async function startPolling(account: AccountData): Promise<never> {
           showTypingIndicator(baseUrl, token, senderId, msg.context_token).catch(() => {});
         }
 
+        // Download and decrypt image if this is an image message
+        let content = extracted.text;
+        if (extracted.msgType === "image" && extracted.mediaItem) {
+          const savedPath = await downloadAndSaveImage(
+            extracted.mediaItem as ImageItem, senderId,
+          );
+          if (savedPath) {
+            content = `[图片: ${savedPath}]`;
+          }
+        }
+
         // Build meta for the <channel> tag
         const meta: Record<string, string> = {
           sender: senderShort,
@@ -930,7 +1006,7 @@ async function startPolling(account: AccountData): Promise<never> {
 
         await mcp.notification({
           method: "notifications/claude/channel",
-          params: { content: extracted.text, meta },
+          params: { content, meta },
         });
       }
     } catch (err) {
